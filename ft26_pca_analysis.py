@@ -906,6 +906,7 @@ def render_site(
     ballot_candidate_payload = ballot_candidates.to_dict(orient="records")
 
     variance_payload = variance_df.to_dict(orient="records")
+
     loading_payload = {
         "pc1_negative": pc1_negative,
         "pc1_positive": pc1_positive,
@@ -1138,19 +1139,19 @@ def render_site(
               <p>Hvert punkt er et partis gennemsnitsplacering. Krydsene viser spredningen i partiets kandidater på PC1 og PC2.</p>
             </div>
           </div>
-          <div id="centroid-chart" class="plot-frame plot-frame-short"></div>
+          <div id="centroid-chart" class="plot-frame"></div>
         </section>
 
-        <div class="figure-stack">
-          <figure class="figure-card">
-            <img src="../figures/question_loadings.png" alt="Question loading plot">
-            <figcaption>De spørgsmål, der driver PC1 og PC2 mest i hver retning.</figcaption>
-          </figure>
-          <figure class="figure-card narrow-figure">
-            <img src="../figures/explained_variance.png" alt="Explained variance plot">
-            <figcaption>Hvor meget variation de første fire komponenter forklarer.</figcaption>
-          </figure>
-        </div>
+        <section class="interactive-block">
+          <div class="interactive-head">
+            <div>
+              <h3>Forklaret variation pr. komponent</h3>
+              <p>Viser både hver komponents andel og den kumulative forklaringsgrad.</p>
+            </div>
+          </div>
+          <div id="explained-variance-chart" class="plot-frame plot-frame-short"></div>
+          <p class="table-note">Hvor meget variation de første fire komponenter forklarer, samt den kumulative andel.</p>
+        </section>
       </section>
 
       <section id="downloads" class="section">
@@ -1695,12 +1696,27 @@ h1 {
   padding: 18px;
 }
 
-.figure-card img {
-  display: block;
-  width: 100%;
-  height: auto;
-  border: 1px solid var(--line);
-  background: white;
+.figure-block-head {
+  margin-bottom: 12px;
+}
+
+.figure-block-head h3 {
+  font-size: 1.15rem;
+  margin-bottom: 4px;
+}
+
+.figure-block-head p {
+  margin: 0;
+  color: var(--muted);
+  max-width: 64ch;
+}
+
+.figure-plot {
+  min-height: 560px;
+}
+
+.plot-frame-short.figure-plot {
+  min-height: 420px;
 }
 
 .figure-card figcaption {
@@ -1798,6 +1814,7 @@ h1 {
         """
 const candidateChartEl = document.getElementById("candidate-chart");
 const centroidChartEl = document.getElementById("centroid-chart");
+const explainedVarianceChartEl = document.getElementById("explained-variance-chart");
 const filterEl = document.getElementById("party-filter");
 const municipalitySelectEl = document.getElementById("municipality-select");
 const municipalitySummaryEl = document.getElementById("municipality-summary");
@@ -2314,6 +2331,67 @@ function renderCentroidChart() {
   );
 }
 
+function renderExplainedVarianceChart() {
+  const rows = siteData.variance || [];
+  const traces = [
+    {
+      type: "bar",
+      x: rows.map((row) => row.component),
+      y: rows.map((row) => row.explained_variance_pct),
+      marker: { color: "#457b9d" },
+      name: "Komponent",
+      hovertemplate: "<b>%{x}</b><br>Forklaret variation: %{y:.1f}%<extra></extra>"
+    },
+    {
+      type: "scatter",
+      mode: "lines+markers",
+      x: rows.map((row) => row.component),
+      y: rows.map((row) => row.cumulative_explained_variance_pct),
+      yaxis: "y2",
+      line: { color: "#0f766e", width: 2.5 },
+      marker: { color: "#0f766e", size: 8 },
+      name: "Kumulativ",
+      hovertemplate: "<b>%{x}</b><br>Kumulativ variation: %{y:.1f}%<extra></extra>"
+    }
+  ];
+
+  Plotly.react(
+    explainedVarianceChartEl,
+    traces,
+    {
+      paper_bgcolor: "#ffffff",
+      plot_bgcolor: "#ffffff",
+      margin: { l: 58, r: 58, t: 24, b: 50 },
+      xaxis: {
+        title: "",
+        gridcolor: "rgba(32,27,23,0.09)"
+      },
+      yaxis: {
+        title: "Forklaret variation (%)",
+        rangemode: "tozero",
+        gridcolor: "rgba(32,27,23,0.09)"
+      },
+      yaxis2: {
+        title: "Kumulativ (%)",
+        overlaying: "y",
+        side: "right",
+        range: [0, 100]
+      },
+      legend: {
+        orientation: "h",
+        y: 1.06,
+        x: 0.02
+      },
+      hoverlabel: {
+        bgcolor: "#fffdf8",
+        bordercolor: "#d9d3ca",
+        font: { color: "#201b17" }
+      }
+    },
+    { responsive: true, displayModeBar: false }
+  );
+}
+
 function syncPartyControls(resetActive = false) {
   const parties = buildCentroids(municipalityRows());
   if (resetActive) {
@@ -2348,6 +2426,7 @@ function boot() {
   computeAxisRanges();
   buildMunicipalityOptions(siteData.municipalities.slice().sort((a, b) => a.name.localeCompare(b.name, "da")));
   syncPartyControls(true);
+  renderExplainedVarianceChart();
 
   municipalitySelectEl.addEventListener("change", () => {
     selectedMunicipality = municipalitySelectEl.value;
