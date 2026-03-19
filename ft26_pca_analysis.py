@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+import base64
 import concurrent.futures
 import dataclasses
 import html
@@ -8,6 +10,7 @@ import os
 import pathlib
 import re
 import textwrap
+import unicodedata
 import warnings
 from datetime import date
 from typing import Any
@@ -39,6 +42,10 @@ RAW_DIR = OUT_DIR / "raw"
 DATA_DIR = OUT_DIR / "data"
 FIG_DIR = OUT_DIR / "figures"
 SITE_DIR = OUT_DIR / "site"
+
+TV2_TEST_URL = "https://nyheder.tv2.dk/kandidattest"
+TV2_BUNDLE_URL = "https://web.tv2a.dk/bundles/1620.d5a2c86687ee2de1.js"
+TV2_AREA_BUNDLE_URL = "https://web.tv2a.dk/bundles/8952.d5a2c86687ee2de1.js"
 
 ANSWER_MAP = {
     1: -2.0,
@@ -161,6 +168,85 @@ class Election:
     valgomat_id: int
 
 
+@dataclasses.dataclass(frozen=True)
+class SiteMeta:
+    source_slug: str
+    source_label: str
+    source_description: str
+    source_attribution: str
+    upload_help_html: str
+
+
+ALTINGET_SITE_META = SiteMeta(
+    source_slug="altinget",
+    source_label="Altinget",
+    source_description="Altingets frontend-API",
+    source_attribution="Kandidatmetadata, områdefiltre og besvarelser er hentet fra samme API som den offentlige kandidattest bruger.",
+    upload_help_html=(
+        "Upload en JSON-fil med svar fra Altinget eller DR. Understøtter både "
+        "<code>Answers</code>-objekter og DR's gemte <code>appStateAnswers</code>/<code>answers</code>-data. "
+        "Svar kan være <code>1, 2, 4, 5</code> eller de projicerede værdier <code>-2, -1, 1, 2</code>."
+    ),
+)
+
+TV2_SITE_META = SiteMeta(
+    source_slug="tv2",
+    source_label="TV 2",
+    source_description="TV 2s offentlige kandidattest-API og statiske spørgmålsmetadata",
+    source_attribution="Kandidatmetadata og besvarelser er hentet fra TV 2s offentlige kandidattest-endpoints, mens spørgsmål og områdemapping kommer fra den publicerede frontend-bundle.",
+    upload_help_html=(
+        "Upload en JSON-fil med svar fra TV 2. Understøtter både direkte "
+        "<code>answers</code>-objekter og hele kandidat-/resultatpayloads. "
+        "Svar kan være <code>-2, -1, 0, 1, 2</code>; <code>0</code> tolkes som neutralt svar."
+    ),
+)
+
+DR_SITE_META = SiteMeta(
+    source_slug="dr",
+    source_label="DR",
+    source_description="Altingets kandidatdata med DR-kompatibel upload-/svarmodel",
+    source_attribution="Kandidatmetadata og kandidatbesvarelser hentes fra Altingets offentlige kandidattest-API, mens uploaden accepterer DR's gemte svarformat.",
+    upload_help_html=ALTINGET_SITE_META.upload_help_html,
+)
+
+PARTY_LEADERS_BY_CODE = {
+    "A": "Mette Frederiksen",
+    "B": "Martin Lidegaard",
+    "C": "Mona Juul",
+    "F": "Pia Olsen Dyhr",
+    "H": "Lars Boje Mathiesen",
+    "I": "Alex Vanopslagh",
+    "M": "Lars Løkke Rasmussen",
+    "O": "Morten Messerschmidt",
+    "V": "Troels Lund Poulsen",
+    "Æ": "Inger Støjberg",
+    "Ø": "Pelle Dragsted",
+    "Å": "Franciska Rosenkilde",
+}
+
+
+def configure_output_dirs(source_slug: str) -> None:
+    global OUT_DIR, RAW_DIR, DATA_DIR, FIG_DIR, SITE_DIR
+
+    output_by_source = {
+        "altinget": pathlib.Path("output/ft26_pca"),
+        "dr": pathlib.Path("output/dr_ft26_pca"),
+        "tv2": pathlib.Path("output/tv2_fv26_pca"),
+    }
+    OUT_DIR = output_by_source[source_slug]
+    RAW_DIR = OUT_DIR / "raw"
+    DATA_DIR = OUT_DIR / "data"
+    FIG_DIR = OUT_DIR / "figures"
+    SITE_DIR = OUT_DIR / "site"
+
+
+def normalize_person_name(value: str | None) -> str:
+    text = unicodedata.normalize("NFKD", (value or "").strip().lower())
+    text = "".join(char for char in text if not unicodedata.combining(char))
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return text.strip()
+
+
 def load_dotenv(env_path: pathlib.Path = ENV_FILE) -> None:
     if not env_path.exists():
         return
@@ -206,6 +292,23 @@ def make_session() -> requests.Session:
             "user-agent": "Mozilla/5.0",
         }
     )
+    return session
+
+
+def make_public_session() -> requests.Session:
+    session = requests.Session()
+    retry = Retry(
+        total=5,
+        connect=5,
+        read=5,
+        backoff_factor=0.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET", "POST"),
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update({"user-agent": "Mozilla/5.0"})
     return session
 
 
@@ -284,6 +387,243 @@ def build_municipality_payload(
         raise RuntimeError("Kommunefiltrering kunne ikke bygges: " + " | ".join(parts))
 
     return payload
+
+
+def download_text(session: requests.Session, url: str) -> str:
+    response = session.get(url, timeout=30)
+    response.raise_for_status()
+    return response.content.decode("utf-8")
+
+
+def parse_js_number(raw: str) -> int:
+    return int(float(raw.replace("E", "e")))
+
+
+def fetch_tv2_page_props(session: requests.Session) -> dict[str, Any]:
+    html_text = download_text(session, TV2_TEST_URL)
+    match = re.search(r'data-bundle="FVCandidateTest" data-props="([^"]+)"', html_text)
+    if not match:
+        raise RuntimeError("Could not find TV 2 candidate-test props in the page HTML.")
+    return json.loads(base64.b64decode(match.group(1)).decode("utf-8"))
+
+
+def fetch_tv2_questions(session: requests.Session) -> list[dict[str, Any]]:
+    bundle_text = download_text(session, TV2_BUNDLE_URL)
+    match = re.search(r'817:\(e,t\)=>\{.*?var a=\[(.*?)\],n=a\.find', bundle_text, re.S)
+    if not match:
+        raise RuntimeError("Could not extract TV 2 question metadata from the frontend bundle.")
+
+    pattern = re.compile(
+        r'\{id:"(?P<id>[^"]+)",type:"(?P<type>[^"]+)",header:"(?P<header>[^"]+)",question:"(?P<question>[^"]+)"'
+        r'(?:,depends:\{selectedArea:"(?P<selected_area>[^"]+)"\})?\}'
+    )
+    questions: list[dict[str, Any]] = []
+    for item in pattern.finditer(match.group(1)):
+        questions.append(
+            {
+                "question_id": item.group("id"),
+                "topic": item.group("header"),
+                "question": item.group("question"),
+                "question_type": item.group("type"),
+                "selected_area": item.group("selected_area"),
+            }
+        )
+    if not questions:
+        raise RuntimeError("TV 2 question bundle was found, but no questions could be parsed.")
+    return questions
+
+
+def fetch_tv2_area_metadata(session: requests.Session) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[int, int]]:
+    bundle_text = download_text(session, TV2_AREA_BUNDLE_URL)
+
+    commune_match = re.search(r"7429:\(e,l\)=>\{.*?l\.communes=\[(.*?)\]\},8580:", bundle_text, re.S)
+    constituency_match = re.search(r"r=l\.greaterConstituencies=\[(.*?)\];l\.communeToGreaterConstituency", bundle_text, re.S)
+    mapping_match = re.search(r"8580:\(e,l\)=>\{.*?var a=\{(.*?)\},r=l\.greaterConstituencies=", bundle_text, re.S)
+    if not commune_match or not constituency_match or not mapping_match:
+        raise RuntimeError("Could not extract TV 2 area metadata from the frontend bundle.")
+
+    communes = [
+        {
+            "value": int(value),
+            "label": label,
+        }
+        for value, label in re.findall(r'\{value:(\d+),label:"([^"]+)"', commune_match.group(1))
+    ]
+    greater_constituencies = [
+        {
+            "value": parse_js_number(value),
+            "label": label,
+        }
+        for value, label in re.findall(r'\{value:(900[0-9e]+),label:"([^"]+)"', constituency_match.group(1))
+    ]
+    commune_to_greater = {
+        int(commune): parse_js_number(greater)
+        for commune, greater in re.findall(r"(\d+):(900[0-9e]+)", mapping_match.group(1))
+    }
+
+    if not communes or not greater_constituencies or not commune_to_greater:
+        raise RuntimeError("TV 2 area metadata was incomplete after parsing.")
+    return communes, greater_constituencies, commune_to_greater
+
+
+def prepare_tv2_questions(session: requests.Session) -> tuple[pd.DataFrame, pd.DataFrame]:
+    question_rows = []
+    for item in fetch_tv2_questions(session):
+        question_rows.append(
+            {
+                "question_id": item["question_id"],
+                "topic": item["topic"],
+                "question": item["question"],
+                "short_label": f"{item['topic']}: {item['question']}",
+            }
+        )
+
+    questions_df = pd.DataFrame(question_rows).sort_values("question_id").reset_index(drop=True)
+    questions_df.to_csv(DATA_DIR / "questions_common.csv", index=False)
+
+    consistency_df = pd.DataFrame(
+        [
+            {
+                "big_group_id": 0,
+                "question_count": len(questions_df),
+                "common_question_count": len(questions_df),
+                "same_as_common_set": True,
+            }
+        ]
+    )
+    consistency_df.to_csv(DATA_DIR / "question_set_consistency.csv", index=False)
+    return questions_df, consistency_df
+
+
+def prepare_tv2_candidates_and_answers(
+    session: requests.Session,
+    api_endpoint: str,
+    questions_df: pd.DataFrame,
+    municipalities: list[dict[str, Any]],
+    greater_constituencies: list[dict[str, Any]],
+    commune_to_greater: dict[int, int],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    greater_lookup = {item["value"]: item["label"] for item in greater_constituencies}
+    municipalities_by_greater: dict[int, list[str]] = {}
+    municipality_payload = []
+    for municipality in sorted(municipalities, key=lambda item: item["label"]):
+        greater_id = commune_to_greater.get(municipality["value"])
+        if greater_id is None:
+            continue
+        greater_name = greater_lookup[greater_id]
+        municipalities_by_greater.setdefault(greater_id, []).append(municipality["label"])
+        municipality_payload.append(
+            {
+                "name": municipality["label"],
+                "kmd_id": municipality["value"],
+                "big_constituency_name": greater_name,
+                "small_constituencies": [greater_name],
+            }
+        )
+    (RAW_DIR / "municipalities.json").write_text(json.dumps(municipality_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    question_ids = set(questions_df["question_id"].tolist())
+    candidate_rows: list[dict[str, Any]] = []
+    answer_rows: list[dict[str, Any]] = []
+    raw_by_area: dict[int, Any] = {}
+
+    for greater_id, greater_name in greater_lookup.items():
+        payload = session.get(f"{api_endpoint}/results/candidates/{greater_id}", timeout=30)
+        payload.raise_for_status()
+        candidates = payload.json()
+        raw_by_area[greater_id] = candidates
+        for candidate in candidates:
+            candidate_id = int(candidate["id"])
+            party_code = (candidate.get("partyLetter") or "").strip().upper()
+            answers = candidate.get("answers") or {}
+            candidate_rows.append(
+                {
+                    "candidate_id": candidate_id,
+                    "name": candidate.get("name") or "",
+                    "birthdate": None,
+                    "party_id": None,
+                    "party_code": party_code,
+                    "party_name": candidate.get("partyName") or "",
+                    "current_party_code": party_code,
+                    "current_party_name": candidate.get("partyName") or "",
+                    "is_incumbent": None,
+                    "occupation": candidate.get("occupation") or None,
+                    "nomination_constituency": "",
+                    "big_constituency_id": greater_id,
+                    "big_constituency_name": greater_name,
+                    "small_constituency_count": 1,
+                    "small_constituency_names": greater_name,
+                    "url_key": candidate.get("internalUrl") or "",
+                    "is_party_leader": normalize_person_name(candidate.get("name") or "")
+                    == normalize_person_name(PARTY_LEADERS_BY_CODE.get(party_code)),
+                }
+            )
+
+            for question_id, answer_payload in answers.items():
+                if question_id not in question_ids:
+                    continue
+                answer_value = answer_payload.get("answer")
+                mapped_answer = np.nan if answer_value is None else float(answer_value)
+                answer_rows.append(
+                    {
+                        "candidate_id": candidate_id,
+                        "question_id": question_id,
+                        "raw_answer": answer_value,
+                        "mapped_answer": mapped_answer,
+                        "is_important": 0,
+                        "comment": (answer_payload.get("comment") or "").strip() or None,
+                    }
+                )
+
+    (RAW_DIR / "tv2_candidates_by_area.json").write_text(json.dumps(raw_by_area, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    candidates_df = pd.DataFrame(candidate_rows).drop_duplicates(subset=["candidate_id"]).sort_values(
+        ["big_constituency_id", "party_code", "name"]
+    ).reset_index(drop=True)
+    candidates_df.to_csv(DATA_DIR / "candidates.csv", index=False)
+
+    answers_long = pd.DataFrame(answer_rows)
+    answers_long.to_csv(DATA_DIR / "answers_long.csv", index=False)
+    answers_wide = answers_long.pivot(index="candidate_id", columns="question_id", values="mapped_answer")
+    answers_wide = answers_wide.reindex(columns=questions_df["question_id"].tolist())
+    answers_wide.to_csv(DATA_DIR / "answers_wide.csv")
+    return candidates_df, answers_wide
+
+
+def prepare_tv2_source(
+    session: requests.Session,
+) -> tuple[Election, SiteMeta, list[dict[str, Any]], pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    props = fetch_tv2_page_props(session)
+    communes, greater_constituencies, commune_to_greater = fetch_tv2_area_metadata(session)
+    questions_df, question_consistency_df = prepare_tv2_questions(session)
+    candidates_df, answers_wide = prepare_tv2_candidates_and_answers(
+        session,
+        props["apiEndpoint"],
+        questions_df,
+        communes,
+        greater_constituencies,
+        commune_to_greater,
+    )
+
+    greater_lookup = {item["value"]: item["label"] for item in greater_constituencies}
+    municipality_payload = [
+        {
+            "name": item["label"],
+            "kmd_id": item["value"],
+            "big_constituency_name": greater_lookup[commune_to_greater[item["value"]]],
+            "small_constituencies": [greater_lookup[commune_to_greater[item["value"]]]],
+        }
+        for item in sorted(communes, key=lambda row: row["label"])
+        if item["value"] in commune_to_greater
+    ]
+
+    election = Election(
+        ID=0,
+        Prefix="FV2026 TV2",
+        Name="Folketingsvalg 2026 · TV 2 kandidattest",
+        valgomat_id=0,
+    )
+    return election, TV2_SITE_META, municipality_payload, questions_df, question_consistency_df, candidates_df, answers_wide
 
 
 def fetch_election_metadata(session: requests.Session) -> tuple[Election, list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
@@ -467,6 +807,9 @@ def prepare_candidates(
             None,
         )
         big_lineup = next((lineup for lineup in lineups if lineup.get("groupType") == "Bigconstituency"), None)
+        is_party_leader = normalize_person_name(candidate["name"]) == normalize_person_name(
+            PARTY_LEADERS_BY_CODE.get(candidate["party_code"])
+        )
         candidate_rows.append(
             {
                 "candidate_id": candidate_id,
@@ -489,6 +832,7 @@ def prepare_candidates(
                 "nomination_constituency": primary_small.get("lineUpName") if primary_small else None,
                 "small_constituency_count": len(candidate["small_constituency_ids"]),
                 "small_constituency_names": " | ".join(sorted(candidate["small_constituency_names"])),
+                "is_party_leader": is_party_leader,
             }
         )
 
@@ -623,10 +967,10 @@ def run_pca(
     variance_df.to_csv(DATA_DIR / "explained_variance.csv", index=False)
 
     model_payload = {
-        "question_ids": [int(question_id) for question_id in questions_df["question_id"].tolist()],
+        "question_ids": [str(question_id) for question_id in questions_df["question_id"].tolist()],
         "questions": [
             {
-                "question_id": int(row.question_id),
+                "question_id": str(row.question_id),
                 "topic": row.topic,
                 "question": row.question,
                 "short_label": row.short_label,
@@ -655,6 +999,7 @@ def render_figures(
     loadings_df: pd.DataFrame,
     party_centroids: pd.DataFrame,
     variance_df: pd.DataFrame,
+    analysis_label: str,
 ) -> None:
     sns.set_theme(style="whitegrid", context="talk")
 
@@ -668,7 +1013,7 @@ def render_figures(
         ax.text(row.PC1, row.PC2, label, fontsize=10, ha="left", va="bottom")
     ax.axhline(0, color="black", linewidth=0.8, alpha=0.5)
     ax.axvline(0, color="black", linewidth=0.8, alpha=0.5)
-    ax.set_title("FT26 candidate PCA: party centroids and candidate cloud")
+    ax.set_title(f"{analysis_label} candidate PCA: party centroids and candidate cloud")
     ax.set_xlabel(f"PC1 ({variance_df.iloc[0]['explained_variance_pct']:.1f}% explained variance)")
     ax.set_ylabel(f"PC2 ({variance_df.iloc[1]['explained_variance_pct']:.1f}% explained variance)")
     fig.tight_layout()
@@ -691,7 +1036,7 @@ def render_figures(
     )
     ax.axhline(0, color="black", linewidth=0.8, alpha=0.5)
     ax.axvline(0, color="black", linewidth=0.8, alpha=0.5)
-    ax.set_title("FT26 candidate PCA: candidates coloured by largest parties")
+    ax.set_title(f"{analysis_label} candidate PCA: candidates coloured by largest parties")
     ax.set_xlabel(f"PC1 ({variance_df.iloc[0]['explained_variance_pct']:.1f}% explained variance)")
     ax.set_ylabel(f"PC2 ({variance_df.iloc[1]['explained_variance_pct']:.1f}% explained variance)")
     ax.legend(title="", frameon=True, loc="best")
@@ -856,6 +1201,7 @@ def build_summary(
 
 def render_site(
     election: Election,
+    site_meta: SiteMeta,
     candidates_df: pd.DataFrame,
     answers_wide: pd.DataFrame,
     scores_df: pd.DataFrame,
@@ -865,8 +1211,6 @@ def render_site(
     model_payload: dict[str, Any],
     questions_df: pd.DataFrame,
     question_consistency_df: pd.DataFrame,
-    big_constituencies: list[dict[str, Any]],
-    small_constituencies: list[dict[str, Any]],
     municipalities: list[dict[str, Any]],
 ) -> None:
     summary = build_summary(
@@ -882,7 +1226,7 @@ def render_site(
     _, pc1_negative, pc1_positive = component_copy("PC1", variance_df, loadings_df, party_centroids)
     _, pc2_negative, pc2_positive = component_copy("PC2", variance_df, loadings_df, party_centroids)
     color_map = party_color_map(party_centroids)
-    municipality_payload = build_municipality_payload(municipalities, big_constituencies, small_constituencies)
+    municipality_payload = municipalities
 
     interactive_candidates = (
         scores_df[
@@ -894,6 +1238,7 @@ def render_site(
                 "big_constituency_name",
                 "nomination_constituency",
                 "small_constituency_names",
+                "is_party_leader",
                 "answered_questions",
                 "PC1",
                 "PC2",
@@ -942,6 +1287,7 @@ def render_site(
         "variance": variance_payload,
         "loadings": loading_payload,
         "model": model_payload,
+        "site_meta": dataclasses.asdict(site_meta),
     }
 
     variance_cards = "".join(
@@ -973,6 +1319,8 @@ def render_site(
         </section>
         """
 
+    big_constituency_total = len({item["big_constituency_name"] for item in municipality_payload})
+
     html_doc = f"""<!DOCTYPE html>
 <html lang="da">
 <head>
@@ -987,18 +1335,18 @@ def render_site(
     <header class="masthead">
       <div class="masthead-grid">
         <div>
-          <p class="kicker">Altinget kandidattest · PCA analyse</p>
+          <p class="kicker">{html.escape(site_meta.source_label)} kandidattest · PCA analyse</p>
           <h1>{html.escape(election.Name)}</h1>
           <p class="lede">
-            En statisk webrapport over {html.escape(election.Prefix)}-kandidattesten bygget direkte fra Altingets frontend-API.
+            En statisk webrapport over {html.escape(election.Prefix)}-kandidattesten bygget direkte fra {html.escape(site_meta.source_description)}.
             Analysen reducerer {summary['question_total']} fælles spørgsmål til de vigtigste mønstre i kandidaternes svar.
           </p>
         </div>
         <dl class="meta-strip">
           <div><dt>Kørt</dt><dd>{summary['run_date']}</dd></div>
           <div><dt>Valgomat</dt><dd>{election.valgomat_id}</dd></div>
-          <div><dt>Storkredse</dt><dd>{len(big_constituencies)}</dd></div>
-          <div><dt>Opstillingskredse</dt><dd>{len(small_constituencies)}</dd></div>
+          <div><dt>Storkredse</dt><dd>{big_constituency_total}</dd></div>
+          <div><dt>Kommuner</dt><dd>{len(municipality_payload)}</dd></div>
         </dl>
       </div>
     </header>
@@ -1015,7 +1363,7 @@ def render_site(
       <div class="scope-card">
         <div>
           <p id="scope-heading" class="scope-label">Visning</p>
-          <p class="scope-description">Vælg en kommune for at se de kandidater, der faktisk står på stemmesedlen dér, og filtrere figurerne derefter.</p>
+          <p class="scope-description">Vælg en kommune for at filtrere kandidater og figurer til det relevante område.</p>
         </div>
         <div class="scope-controls">
           <label class="scope-field" for="municipality-select">Kommune</label>
@@ -1052,7 +1400,7 @@ def render_site(
             <h3>Datakvalitet</h3>
             <ul class="plain-list">
               <li>Spørgsmålsgrundlaget er ens på tværs af alle storkredse: {summary['question_set_deviations']} afvigelser fundet.</li>
-              <li>Kandidatmetadata, stemmesedler og besvarelser er hentet fra samme API som den offentlige kandidattest bruger.</li>
+              <li>{html.escape(site_meta.source_attribution)}</li>
               <li>Alle råfiler og mellemresultater ligger ved siden af websiden, så analysen kan revideres.</li>
             </ul>
           </article>
@@ -1126,8 +1474,8 @@ def render_site(
         </article>
 
         <article class="table-card full-width-card">
-          <h3>Kandidater på stemmesedlen</h3>
-          <p class="table-note">Vælg en kommune for at se de kandidater, du faktisk kan stemme på dér.</p>
+          <h3>Kandidater i det valgte område</h3>
+          <p class="table-note">Vælg en kommune for at se de kandidater, der hører til det valgte område.</p>
           <div id="table-candidates"></div>
         </article>
       </section>
@@ -1142,7 +1490,7 @@ def render_site(
           <div class="interactive-head">
             <div>
               <h3>Kandidater i PC1/PC2-rummet</h3>
-              <p>Farvet efter parti. Upload dine egne svar for at lægge et ekstra punkt oven på feltet, og brug filtrene til at skjule eller fremhæve partier.</p>
+              <p>Farvet efter parti. Upload flere svarfiler for at lægge jeres profiler oven på feltet, brug filtrene til at skjule eller fremhæve partier, og se partiformænd markeret med en åben cirkel.</p>
             </div>
             <div class="filter-actions">
               <button type="button" class="filter-button" data-filter-action="all">Vis alle</button>
@@ -1151,16 +1499,17 @@ def render_site(
           </div>
           <div class="upload-panel" aria-labelledby="upload-panel-title">
             <div class="upload-copy">
-              <p class="upload-kicker">Placér dig selv</p>
-              <h4 id="upload-panel-title">Upload dine egne svar</h4>
-              <p>Upload en JSON-fil i Altingets format med <code>Answers</code> og eventuelt <code>Importants</code>. Svar skal ligge som <code>1, 2, 4, 5</code>.</p>
+              <p class="upload-kicker">Placér jer sammen</p>
+              <h4 id="upload-panel-title">Upload jeres svar</h4>
+              <p>{site_meta.upload_help_html}</p>
             </div>
             <div class="upload-actions">
               <label class="upload-button" for="answers-upload-input">Upload JSON</label>
-              <input id="answers-upload-input" class="upload-input" type="file" accept=".json,application/json,text/plain">
-              <button type="button" id="clear-upload-button" class="filter-button" disabled>Fjern profil</button>
+              <input id="answers-upload-input" class="upload-input" type="file" accept=".json,application/json,text/plain" multiple>
+              <button type="button" id="clear-upload-button" class="filter-button" disabled>Fjern alle</button>
             </div>
-            <p id="upload-status" class="upload-status">Ingen profil uploadet endnu.</p>
+            <p id="upload-status" class="upload-status">Ingen profiler uploadet endnu.</p>
+            <div id="upload-profiles" class="upload-profiles"></div>
           </div>
           <div id="party-filter" class="party-filter" aria-label="Partifilter"></div>
           <div id="candidate-chart" class="plot-frame"></div>
@@ -1752,6 +2101,41 @@ h1 {
   color: var(--warm);
 }
 
+.upload-profiles {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 10px;
+}
+
+.upload-profile-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  background: #fffdf8;
+}
+
+.upload-profile-copy {
+  min-width: 0;
+}
+
+.upload-profile-name {
+  margin: 0 0 2px;
+  font-weight: 600;
+}
+
+.upload-profile-meta {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.92rem;
+}
+
+.upload-profile-remove {
+  flex: 0 0 auto;
+}
+
 .filter-actions {
   display: flex;
   gap: 8px;
@@ -1952,6 +2336,7 @@ const municipalitySummaryEl = document.getElementById("municipality-summary");
 const answersUploadInputEl = document.getElementById("answers-upload-input");
 const clearUploadButtonEl = document.getElementById("clear-upload-button");
 const uploadStatusEl = document.getElementById("upload-status");
+const uploadProfilesEl = document.getElementById("upload-profiles");
 const partySectionCopyEl = document.getElementById("party-section-copy");
 const figureSectionCopyEl = document.getElementById("figure-section-copy");
 const tablePc1NegEl = document.getElementById("table-pc1-neg");
@@ -1964,7 +2349,7 @@ let siteData = null;
 let activeParties = new Set();
 let axisRanges = null;
 let selectedMunicipality = "__all__";
-let uploadedProfile = null;
+let uploadedProfiles = [];
 
 const ALL_MUNICIPALITIES = "__all__";
 const TABLE_LIMIT = 5;
@@ -2002,26 +2387,28 @@ function updateUploadStatus(message, tone = "") {
 }
 
 function setUploadButtonState() {
-  clearUploadButtonEl.disabled = !uploadedProfile;
+  clearUploadButtonEl.disabled = !uploadedProfiles.length;
 }
 
 function currentAxisRanges() {
   if (!axisRanges) {
     return null;
   }
-  if (!uploadedProfile) {
+  if (!uploadedProfiles.length) {
     return axisRanges;
   }
   const xPad = Math.max((axisRanges.x[1] - axisRanges.x[0]) * 0.04, 0.35);
   const yPad = Math.max((axisRanges.y[1] - axisRanges.y[0]) * 0.04, 0.35);
+  const profileXs = uploadedProfiles.map((profile) => profile.PC1);
+  const profileYs = uploadedProfiles.map((profile) => profile.PC2);
   return {
     x: [
-      Math.min(axisRanges.x[0], uploadedProfile.PC1 - xPad),
-      Math.max(axisRanges.x[1], uploadedProfile.PC1 + xPad)
+      Math.min(axisRanges.x[0], ...profileXs.map((value) => value - xPad)),
+      Math.max(axisRanges.x[1], ...profileXs.map((value) => value + xPad))
     ],
     y: [
-      Math.min(axisRanges.y[0], uploadedProfile.PC2 - yPad),
-      Math.max(axisRanges.y[1], uploadedProfile.PC2 + yPad)
+      Math.min(axisRanges.y[0], ...profileYs.map((value) => value - yPad)),
+      Math.max(axisRanges.y[1], ...profileYs.map((value) => value + yPad))
     ]
   };
 }
@@ -2033,16 +2420,76 @@ function parseJsonAnswerRows(text) {
   } catch (error) {
     throw new Error("JSON-filen kunne ikke læses.");
   }
-  const answers = payload && typeof payload === "object" && !Array.isArray(payload)
-    ? (payload.Answers && typeof payload.Answers === "object" ? payload.Answers : payload)
-    : null;
-  if (!answers || Array.isArray(answers)) {
-    throw new Error("JSON-filen skal indeholde et objekt med Answers.");
+  function normalizeAnswerRowObject(row) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) {
+      return [];
+    }
+    const questionId = row.question_id ?? row.questionId ?? row.questionID ?? row.id ?? row.key ?? "";
+    const questionText = row.question ?? row.questionText ?? row.text ?? row.label ?? row.title ?? "";
+    const answer = row.answer ?? row.value ?? row.selected ?? row.response ?? row.choice ?? "";
+    if (!questionId && !questionText) {
+      return [];
+    }
+    return [{
+      question_id: questionId == null ? "" : String(questionId),
+      question_text: questionText == null ? "" : String(questionText),
+      answer: answer == null ? "" : String(answer)
+    }];
   }
-  return Object.entries(answers).map(([questionId, answer]) => ({
-    question_id: questionId,
-    answer: answer == null ? "" : String(answer)
-  }));
+
+  function objectEntriesToRows(answers) {
+    return Object.entries(answers).map(([questionId, answer]) => {
+      if (answer && typeof answer === "object" && !Array.isArray(answer)) {
+        return {
+          question_id: String(questionId),
+          question_text: String(answer.question || answer.questionText || answer.text || ""),
+          answer: answer.answer == null ? "" : String(answer.answer)
+        };
+      }
+      return {
+        question_id: String(questionId),
+        question_text: "",
+        answer: answer == null ? "" : String(answer)
+      };
+    });
+  }
+
+  if (Array.isArray(payload)) {
+    return payload.flatMap(normalizeAnswerRowObject);
+  }
+  if (!payload || typeof payload !== "object") {
+    throw new Error("JSON-filen skal indeholde svar i et understøttet format.");
+  }
+  if (payload.Answers && typeof payload.Answers === "object" && !Array.isArray(payload.Answers)) {
+    return objectEntriesToRows(payload.Answers);
+  }
+  if (Array.isArray(payload.appStateAnswers)) {
+    return payload.appStateAnswers.flatMap((row) => normalizeAnswerRowObject({
+      questionID: row.questionID,
+      questionText: row.questionText,
+      value: row.value
+    }));
+  }
+  if (payload.answers && typeof payload.answers === "object") {
+    if (Array.isArray(payload.answers)) {
+      return payload.answers.flatMap(normalizeAnswerRowObject);
+    }
+    return objectEntriesToRows(payload.answers);
+  }
+  if (payload.userAnswers && typeof payload.userAnswers === "object" && !Array.isArray(payload.userAnswers)) {
+    return objectEntriesToRows(payload.userAnswers);
+  }
+  if (Array.isArray(payload.candidates) && payload.candidates.length === 1 && payload.candidates[0]?.answers) {
+    return objectEntriesToRows(payload.candidates[0].answers);
+  }
+  if (payload.answers && Array.isArray(payload.answers)) {
+    return payload.answers.flatMap(normalizeAnswerRowObject);
+  }
+  const directRows = normalizeAnswerRowObject(payload);
+  if (directRows.length) {
+    return directRows;
+  }
+  return objectEntriesToRows(payload);
 }
 
 function parseAnswerRows(text) {
@@ -2050,8 +2497,8 @@ function parseAnswerRows(text) {
   if (!cleaned) {
     throw new Error("Filen er tom.");
   }
-  if (!cleaned.startsWith("{")) {
-    throw new Error("Upload en JSON-fil i Altingets format.");
+  if (!cleaned.startsWith("{") && !cleaned.startsWith("[")) {
+    throw new Error("Upload en JSON-fil i et understøttet kandidattest-format.");
   }
   return parseJsonAnswerRows(cleaned);
 }
@@ -2061,10 +2508,43 @@ function normalizeAnswerValue(rawValue) {
   if (!trimmed) {
     return null;
   }
+  const sourceSlug = siteData.site_meta?.source_slug || "altinget";
+  const normalizedLabel = trimmed.toLowerCase();
+  const labelMap = sourceSlug === "tv2"
+    ? {
+        "helt uenig": -2,
+        "meget uenig": -2,
+        "uenig": -1,
+        "neutral": 0,
+        "enig": 1,
+        "helt enig": 2,
+        "meget enig": 2
+      }
+    : {
+        "uenig": -2,
+        "helt uenig": -2,
+        "meget uenig": -2,
+        "lidt uenig": -1,
+        "delvist uenig": -1,
+        "lidt enig": 1,
+        "delvist enig": 1,
+        "enig": 2,
+        "helt enig": 2,
+        "meget enig": 2
+      };
+  if (["spring over", "skipped", "skip"].includes(normalizedLabel)) {
+    return null;
+  }
+  if (labelMap[normalizedLabel] !== undefined) {
+    return labelMap[normalizedLabel];
+  }
   const normalized = trimmed.replace(",", ".");
   const numericValue = Number(normalized);
   if (Number.isNaN(numericValue)) {
     throw new Error(`Ugyldigt svar "${trimmed}".`);
+  }
+  if (sourceSlug === "tv2" && [-2, -1, 0, 1, 2].includes(numericValue)) {
+    return numericValue;
   }
   const mapped = siteData.model.answer_map[String(Math.trunc(numericValue))];
   if (mapped !== undefined && Number.isInteger(numericValue)) {
@@ -2076,42 +2556,111 @@ function normalizeAnswerValue(rawValue) {
   throw new Error(`Svaret "${trimmed}" er ikke understøttet.`);
 }
 
+function normalizeQuestionKey(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\\u0300-\\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function labelFromFileName(fileName) {
+  return String(fileName || "Profil").replace(/\.[^.]+$/, "").trim() || "Profil";
+}
+
+function upsertUploadedProfile(profile) {
+  const nextProfiles = uploadedProfiles.filter((item) => item.label !== profile.label);
+  nextProfiles.push(profile);
+  uploadedProfiles = nextProfiles.sort((a, b) => a.label.localeCompare(b.label, "da"));
+}
+
+function removeUploadedProfile(label) {
+  uploadedProfiles = uploadedProfiles.filter((profile) => profile.label !== label);
+}
+
+function renderUploadedProfilesList() {
+  uploadProfilesEl.innerHTML = "";
+  for (const profile of uploadedProfiles) {
+    const item = document.createElement("div");
+    item.className = "upload-profile-item";
+
+    const copy = document.createElement("div");
+    copy.className = "upload-profile-copy";
+
+    const name = document.createElement("p");
+    name.className = "upload-profile-name";
+    name.textContent = profile.label;
+
+    const meta = document.createElement("p");
+    meta.className = "upload-profile-meta";
+    meta.textContent = `PC1 ${formatNumber(profile.PC1)}, PC2 ${formatNumber(profile.PC2)}, PC3 ${formatNumber(profile.PC3)}, PC4 ${formatNumber(profile.PC4)}`;
+
+    const removeButton = document.createElement("button");
+    removeButton.type = "button";
+    removeButton.className = "filter-button upload-profile-remove";
+    removeButton.textContent = "Fjern";
+    removeButton.addEventListener("click", () => {
+      removeUploadedProfile(profile.label);
+      setUploadButtonState();
+      renderUploadedProfileStatus();
+      renderCandidateChart();
+      renderCentroidChart();
+    });
+
+    copy.append(name, meta);
+    item.append(copy, removeButton);
+    uploadProfilesEl.appendChild(item);
+  }
+}
+
 function profileTrace(profile) {
   return {
     type: "scatter",
     mode: "markers+text",
-    name: "Dig",
+    name: profile.label,
     x: [profile.PC1],
     y: [profile.PC2],
-    text: ["Dig"],
+    text: [profile.label],
     textposition: "top center",
     textfont: {
-      size: 14,
+      size: 12,
       color: "#201b17",
       family: "Avenir Next, Segoe UI, sans-serif"
     },
     marker: {
-      size: 19,
+      size: 13,
       color: "#201b17",
       symbol: "star-diamond",
       line: { color: "#fffdf8", width: 1.4 }
     },
     hovertemplate:
-      "<b>Din profil</b><br>" +
+      "<b>%{text}</b><br>" +
       "PC1: %{x:.2f}<br>" +
       "PC2: %{y:.2f}<br>" +
       "PC3: " + formatNumber(profile.PC3) + "<br>" +
-      "PC4: " + formatNumber(profile.PC4) + "<br>" +
-      "Besvarede spørgsmål: " + profile.answeredQuestions + "<extra></extra>"
+      "PC4: " + formatNumber(profile.PC4) + "<extra></extra>"
   };
 }
 
 function projectUploadedAnswers(rows) {
   const questionIds = siteData.model.question_ids || [];
+  const questionLookup = new Map();
+  for (const question of siteData.model.questions || []) {
+    const questionId = String(question.question_id || "");
+    for (const label of [question.question, question.short_label]) {
+      const normalized = normalizeQuestionKey(label);
+      if (normalized) {
+        questionLookup.set(normalized, questionId);
+      }
+    }
+  }
   const lookup = new Map();
   for (const row of rows) {
-    const questionId = Number.parseInt(String(row.question_id || "").trim(), 10);
-    if (!Number.isFinite(questionId)) {
+    const rawQuestionId = String(row.question_id || "").trim();
+    const questionId = rawQuestionId || questionLookup.get(normalizeQuestionKey(row.question_text)) || "";
+    if (!questionId) {
       continue;
     }
     const normalizedAnswer = normalizeAnswerValue(row.answer);
@@ -2124,7 +2673,7 @@ function projectUploadedAnswers(rows) {
   const answerVector = [];
   let answeredQuestions = 0;
   for (let index = 0; index < questionIds.length; index += 1) {
-    const questionId = questionIds[index];
+    const questionId = String(questionIds[index]);
     const answer = lookup.get(questionId);
     if (answer === undefined) {
       answerVector.push(Number(siteData.model.imputer_statistics[index]));
@@ -2174,8 +2723,7 @@ function formatBallotScopeForHover(row, municipality) {
   if (!scopes.length) {
     return "Ikke oplyst";
   }
-  const label = scopes.length === 1 ? "opstillingskreds" : "opstillingskredse";
-  return `${scopes.length} ${label}`;
+  return scopes.join(", ");
 }
 
 function titleWithMunicipality(title) {
@@ -2285,7 +2833,6 @@ function buildPartyControls(parties) {
 }
 
 function candidateTrace(partyName, rows) {
-  const municipality = selectedMunicipalityRecord();
   return {
     type: "scattergl",
     mode: "markers",
@@ -2302,24 +2849,47 @@ function candidateTrace(partyName, rows) {
       row.name,
       row.party_name,
       row.party_code,
-      row.big_constituency_name || "",
-      row.nomination_constituency || "",
-      formatBallotScopeForHover(row, municipality),
-      row.answered_questions,
       row.PC3,
       row.PC4
     ]),
     hovertemplate:
       "<b>%{customdata[0]}</b><br>" +
       "%{customdata[2]} · %{customdata[1]}<br>" +
-      "Storkreds: %{customdata[3]}<br>" +
-      "Nominationskreds: %{customdata[4]}<br>" +
-      "Stiller op i: %{customdata[5]}<br>" +
       "PC1: %{x:.2f}<br>" +
       "PC2: %{y:.2f}<br>" +
-      "PC3: %{customdata[7]:.2f}<br>" +
-      "PC4: %{customdata[8]:.2f}<br>" +
-      "Besvarede spørgsmål: %{customdata[6]}<extra></extra>"
+      "PC3: %{customdata[3]:.2f}<br>" +
+      "PC4: %{customdata[4]:.2f}<extra></extra>"
+  };
+}
+
+function partyLeaderTrace(rows) {
+  return {
+    type: "scatter",
+    mode: "markers",
+    name: "Partiformænd",
+    x: rows.map((row) => row.PC1),
+    y: rows.map((row) => row.PC2),
+    marker: {
+      size: 16,
+      color: rows.map((row) => row.color),
+      symbol: "circle-open",
+      line: { color: "#201b17", width: 2.2 }
+    },
+    customdata: rows.map((row) => [
+      row.name,
+      row.party_name,
+      row.party_code,
+      row.PC3,
+      row.PC4
+    ]),
+    hovertemplate:
+      "<b>Partiformand</b><br>" +
+      "%{customdata[2]} · %{customdata[1]}<br>" +
+      "%{customdata[0]}<br>" +
+      "PC1: %{x:.2f}<br>" +
+      "PC2: %{y:.2f}<br>" +
+      "PC3: %{customdata[3]:.2f}<br>" +
+      "PC4: %{customdata[4]:.2f}<extra></extra>"
   };
 }
 
@@ -2461,11 +3031,8 @@ function updateScopeCopy() {
     figureSectionCopyEl.textContent = "De vigtigste PCA-figurer er gjort interaktive. Filtrér partier, vælg kommune, upload dine egne svar, og hold musen over en kandidat for at se navn, parti og placering.";
     return;
   }
-  const municipality = selectedMunicipalityRecord();
-  const scopeCount = municipality ? municipality.small_constituencies.length : 0;
-  const constituencyLabel = scopeCount === 1 ? "opstillingskreds" : "opstillingskredse";
-  partySectionCopyEl.textContent = `Tabellerne viser partiernes gennemsnitlige placering og interne spænd blandt kandidater, der står på stemmesedlen i ${selectedMunicipality}.`;
-  figureSectionCopyEl.textContent = `De interaktive figurer viser kun kandidater, der står på stemmesedlen i ${selectedMunicipality} på tværs af ${scopeCount} ${constituencyLabel}, og kan suppleres med din egen profil.`;
+  partySectionCopyEl.textContent = `Tabellerne viser partiernes gennemsnitlige placering og interne spænd blandt kandidater i området omkring ${selectedMunicipality}.`;
+  figureSectionCopyEl.textContent = `De interaktive figurer viser kun kandidater i området omkring ${selectedMunicipality} og kan suppleres med din egen profil.`;
 }
 
 function updateMunicipalitySummary(rows, centroids) {
@@ -2474,10 +3041,8 @@ function updateMunicipalitySummary(rows, centroids) {
     return;
   }
   const municipality = selectedMunicipalityRecord();
-  const bigConstituency = municipality?.big_constituency_name || "ukendt storkreds";
-  const scopeCount = municipality ? municipality.small_constituencies.length : 0;
-  const constituencyLabel = scopeCount === 1 ? "opstillingskreds" : "opstillingskredse";
-  municipalitySummaryEl.textContent = `Viser ${selectedMunicipality}: ${rows.length} kandidater i PCA fordelt på ${centroids.length} partier. Kommunevalglisten ligger i ${bigConstituency} og dækker ${scopeCount} ${constituencyLabel}.`;
+  const bigConstituency = municipality?.big_constituency_name || "ukendt område";
+  municipalitySummaryEl.textContent = `Viser ${selectedMunicipality}: ${rows.length} kandidater i PCA fordelt på ${centroids.length} partier. Området hører til ${bigConstituency}.`;
 }
 
 function createTable(container, columns, rows, emptyMessage = "Ingen rækker at vise.") {
@@ -2560,7 +3125,7 @@ function renderCandidateTable() {
       tableCandidatesEl,
       [],
       [],
-      "Vælg en kommune for at se de kandidater, der faktisk står på stemmesedlen dér."
+      "Vælg en kommune for at se de kandidater, der hører til det valgte område."
     );
     return;
   }
@@ -2584,7 +3149,7 @@ function renderCandidateTable() {
       { key: "party_name", label: "Parti" },
       { key: "name", label: "Kandidat" },
       { key: "nomination_constituency", label: "Nominationskreds", format: (value) => value || "Ikke oplyst" },
-      { key: "municipality_scope", label: "På stemmesedlen i", format: (value) => value || "Hele kommunen" }
+      { key: "municipality_scope", label: "Område", format: (value) => value || "Ikke oplyst" }
     ],
     rows,
     "Ingen kandidater fundet for den valgte kommune."
@@ -2592,33 +3157,50 @@ function renderCandidateTable() {
 }
 
 function renderUploadedProfileStatus() {
-  if (!uploadedProfile) {
-    updateUploadStatus("Ingen profil uploadet endnu.");
+  if (!uploadedProfiles.length) {
+    updateUploadStatus("Ingen profiler uploadet endnu.");
+    renderUploadedProfilesList();
     return;
   }
-  updateUploadStatus(
-    `Din profil er lagt ind: ${uploadedProfile.answeredQuestions} svar, PC1 ${formatNumber(uploadedProfile.PC1)}, PC2 ${formatNumber(uploadedProfile.PC2)}.`,
-    "is-success"
-  );
+  const label = uploadedProfiles.length === 1 ? "profil" : "profiler";
+  updateUploadStatus(`${uploadedProfiles.length} ${label} er lagt ind i kompasset.`, "is-success");
+  renderUploadedProfilesList();
 }
 
-async function handleAnswersUpload(file) {
-  try {
-    const rawText = await file.text();
-    const parsedRows = parseAnswerRows(rawText);
-    uploadedProfile = projectUploadedAnswers(parsedRows);
-    setUploadButtonState();
-    renderUploadedProfileStatus();
-    renderCandidateChart();
-    renderCentroidChart();
-  } catch (error) {
-    uploadedProfile = null;
-    setUploadButtonState();
-    updateUploadStatus(error instanceof Error ? error.message : "Kunne ikke læse svarfilen.", "is-error");
-    renderCandidateChart();
-    renderCentroidChart();
-  } finally {
-    answersUploadInputEl.value = "";
+async function handleAnswersUpload(files) {
+  const addedLabels = [];
+  const errors = [];
+  for (const file of files) {
+    try {
+      const rawText = await file.text();
+      const parsedRows = parseAnswerRows(rawText);
+      const profile = projectUploadedAnswers(parsedRows);
+      upsertUploadedProfile({
+        ...profile,
+        label: labelFromFileName(file.name)
+      });
+      addedLabels.push(labelFromFileName(file.name));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Kunne ikke læse svarfilen.";
+      errors.push(`${file.name}: ${message}`);
+    }
+  }
+  setUploadButtonState();
+  renderUploadedProfileStatus();
+  renderCandidateChart();
+  renderCentroidChart();
+  answersUploadInputEl.value = "";
+
+  if (errors.length) {
+    updateUploadStatus(errors.join(" | "), "is-error");
+    renderUploadedProfilesList();
+    return;
+  }
+
+  if (addedLabels.length) {
+    const uploadedLabel = addedLabels.length === 1 ? "profil" : "profiler";
+    updateUploadStatus(`${addedLabels.length} ${uploadedLabel} indlæst: ${addedLabels.join(", ")}.`, "is-success");
+    renderUploadedProfilesList();
   }
 }
 
@@ -2627,9 +3209,11 @@ function renderCandidateChart() {
   const traces = Array.from(grouped.entries())
     .sort((a, b) => a[0].localeCompare(b[0], "da"))
     .map(([partyName, rows]) => candidateTrace(partyName, rows));
-  if (uploadedProfile) {
-    traces.push(profileTrace(uploadedProfile));
+  const partyLeaderRows = visibleCandidateRows().filter((row) => row.is_party_leader);
+  if (partyLeaderRows.length) {
+    traces.push(partyLeaderTrace(partyLeaderRows));
   }
+  traces.push(...uploadedProfiles.map((profile) => profileTrace(profile)));
   const layout = traces.length
     ? baseLayout(
         titleWithMunicipality("Kandidater farvet efter parti"),
@@ -2638,8 +3222,8 @@ function renderCandidateChart() {
       )
     : emptyStateLayout(
         "Kandidater farvet efter parti",
-        uploadedProfile
-          ? "Din profil vises alene, fordi alle partier er skjult i den aktuelle visning."
+        uploadedProfiles.length
+          ? "Profilerne vises alene, fordi alle partier er skjult i den aktuelle visning."
           : "Vælg mindst ét parti for at vise kandidaterne i den valgte kommune."
       );
 
@@ -2654,9 +3238,7 @@ function renderCandidateChart() {
 function renderCentroidChart() {
   const rows = buildCentroids(visibleCandidateRows());
   const traces = rows.length ? [centroidTrace(rows)] : [];
-  if (uploadedProfile) {
-    traces.push(profileTrace(uploadedProfile));
-  }
+  traces.push(...uploadedProfiles.map((profile) => profileTrace(profile)));
   const layout = traces.length
     ? baseLayout(
         titleWithMunicipality("Partiernes gennemsnitlige placering"),
@@ -2665,8 +3247,8 @@ function renderCentroidChart() {
       )
     : emptyStateLayout(
         "Partiernes gennemsnitlige placering",
-        uploadedProfile
-          ? "Din profil vises alene, fordi alle partier er skjult i den aktuelle visning."
+        uploadedProfiles.length
+          ? "Profilerne vises alene, fordi alle partier er skjult i den aktuelle visning."
           : "Vælg mindst ét parti for at vise particentroiderne i den valgte kommune."
       );
   Plotly.react(
@@ -2783,16 +3365,16 @@ function boot() {
   });
 
   answersUploadInputEl.addEventListener("change", async (event) => {
-    const file = event.target.files && event.target.files[0];
-    if (!file) {
+    const files = Array.from(event.target.files || []);
+    if (!files.length) {
       return;
     }
-    updateUploadStatus(`Indlæser ${file.name} ...`);
-    await handleAnswersUpload(file);
+    updateUploadStatus(`Indlæser ${files.length} fil${files.length === 1 ? "" : "er"} ...`);
+    await handleAnswersUpload(files);
   });
 
   clearUploadButtonEl.addEventListener("click", () => {
-    uploadedProfile = null;
+    uploadedProfiles = [];
     answersUploadInputEl.value = "";
     setUploadButtonState();
     renderUploadedProfileStatus();
@@ -2822,28 +3404,57 @@ boot();
         + "\n",
         encoding="utf-8",
     )
-def main() -> None:
-    ensure_dirs()
-    session = make_session()
-    election, big_constituencies, small_constituencies, municipalities = fetch_election_metadata(session)
 
-    (RAW_DIR / "big_constituencies.json").write_text(json.dumps(big_constituencies, ensure_ascii=False, indent=2), encoding="utf-8")
-    (RAW_DIR / "small_constituencies.json").write_text(json.dumps(small_constituencies, ensure_ascii=False, indent=2), encoding="utf-8")
-    (RAW_DIR / "municipalities.json").write_text(json.dumps(municipalities, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    questions_df, question_consistency_df = prepare_questions(session, big_constituencies)
-    candidates_df, candidate_big_group = prepare_candidates(session, small_constituencies)
-    answers_wide = prepare_answers(
-        session,
-        candidates_df,
-        candidate_big_group,
-        questions_df["question_id"].tolist(),
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Generate a PCA-based HTML report from kandidattest data.")
+    parser.add_argument(
+        "--source",
+        choices=["altinget", "dr", "tv2"],
+        default="altinget",
+        help="Which kandidattest source to build the report from.",
     )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    configure_output_dirs(args.source)
+    ensure_dirs()
+
+    if args.source in {"altinget", "dr"}:
+        session = make_session()
+        election, big_constituencies, small_constituencies, raw_municipalities = fetch_election_metadata(session)
+        municipality_payload = build_municipality_payload(raw_municipalities, big_constituencies, small_constituencies)
+
+        (RAW_DIR / "big_constituencies.json").write_text(
+            json.dumps(big_constituencies, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        (RAW_DIR / "small_constituencies.json").write_text(
+            json.dumps(small_constituencies, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        (RAW_DIR / "municipalities.json").write_text(
+            json.dumps(raw_municipalities, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+        questions_df, question_consistency_df = prepare_questions(session, big_constituencies)
+        candidates_df, candidate_big_group = prepare_candidates(session, small_constituencies)
+        answers_wide = prepare_answers(
+            session,
+            candidates_df,
+            candidate_big_group,
+            questions_df["question_id"].tolist(),
+        )
+        site_meta = ALTINGET_SITE_META if args.source == "altinget" else DR_SITE_META
+    else:
+        session = make_public_session()
+        election, site_meta, municipality_payload, questions_df, question_consistency_df, candidates_df, answers_wide = prepare_tv2_source(session)
 
     scores_df, loadings_df, party_centroids, variance_df, model_payload = run_pca(candidates_df, answers_wide, questions_df)
-    render_figures(scores_df, loadings_df, party_centroids, variance_df)
+    render_figures(scores_df, loadings_df, party_centroids, variance_df, analysis_label=election.Prefix)
     render_site(
         election,
+        site_meta,
         candidates_df,
         answers_wide,
         scores_df,
@@ -2853,9 +3464,7 @@ def main() -> None:
         model_payload,
         questions_df,
         question_consistency_df,
-        big_constituencies,
-        small_constituencies,
-        municipalities,
+        municipality_payload,
     )
 
 
