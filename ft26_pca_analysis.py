@@ -547,7 +547,7 @@ def run_pca(
     candidates_df: pd.DataFrame,
     answers_wide: pd.DataFrame,
     questions_df: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     answered_counts = answers_wide.notna().sum(axis=1)
     retained_ids = answered_counts[answered_counts >= MIN_ANSWERED_QUESTIONS].index
     retained_matrix = answers_wide.loc[retained_ids]
@@ -622,12 +622,32 @@ def run_pca(
     )
     variance_df.to_csv(DATA_DIR / "explained_variance.csv", index=False)
 
+    model_payload = {
+        "question_ids": [int(question_id) for question_id in questions_df["question_id"].tolist()],
+        "questions": [
+            {
+                "question_id": int(row.question_id),
+                "topic": row.topic,
+                "question": row.question,
+                "short_label": row.short_label,
+            }
+            for row in questions_df.itertuples(index=False)
+        ],
+        "imputer_statistics": [float(value) for value in imputer.statistics_.tolist()],
+        "scaler_mean": [float(value) for value in scaler.mean_.tolist()],
+        "scaler_scale": [float(value) for value in scaler.scale_.tolist()],
+        "pca_components": [[float(value) for value in row] for row in pca.components_.tolist()],
+        "pca_mean": [float(value) for value in pca.mean_.tolist()],
+        "components": score_columns,
+        "answer_map": {str(key): float(value) for key, value in ANSWER_MAP.items()},
+    }
+
     completeness_df = candidates_df[["candidate_id", "party_code", "party_name", "name"]].copy()
     completeness_df["answered_questions"] = answered_counts.reindex(completeness_df["candidate_id"]).fillna(0).astype(int).values
     completeness_df["is_retained_for_pca"] = completeness_df["candidate_id"].isin(retained_ids)
     completeness_df.to_csv(DATA_DIR / "candidate_answer_completeness.csv", index=False)
 
-    return scores_df, loadings_df, party_centroids, variance_df
+    return scores_df, loadings_df, party_centroids, variance_df, model_payload
 
 
 def render_figures(
@@ -709,7 +729,6 @@ def render_figures(
     fig.tight_layout()
     fig.savefig(FIG_DIR / "explained_variance.png", dpi=200)
     plt.close(fig)
-
 
 def format_pct(value: float) -> str:
     return f"{value:.1f}%"
@@ -843,6 +862,7 @@ def render_site(
     loadings_df: pd.DataFrame,
     party_centroids: pd.DataFrame,
     variance_df: pd.DataFrame,
+    model_payload: dict[str, Any],
     questions_df: pd.DataFrame,
     question_consistency_df: pd.DataFrame,
     big_constituencies: list[dict[str, Any]],
@@ -921,6 +941,7 @@ def render_site(
         "ballot_candidates": ballot_candidate_payload,
         "variance": variance_payload,
         "loadings": loading_payload,
+        "model": model_payload,
     }
 
     variance_cards = "".join(
@@ -1121,12 +1142,25 @@ def render_site(
           <div class="interactive-head">
             <div>
               <h3>Kandidater i PC1/PC2-rummet</h3>
-              <p>Farvet efter parti. Brug filtrene til at skjule eller fremhæve partier.</p>
+              <p>Farvet efter parti. Upload dine egne svar for at lægge et ekstra punkt oven på feltet, og brug filtrene til at skjule eller fremhæve partier.</p>
             </div>
             <div class="filter-actions">
               <button type="button" class="filter-button" data-filter-action="all">Vis alle</button>
               <button type="button" class="filter-button" data-filter-action="none">Skjul alle</button>
             </div>
+          </div>
+          <div class="upload-panel" aria-labelledby="upload-panel-title">
+            <div class="upload-copy">
+              <p class="upload-kicker">Placér dig selv</p>
+              <h4 id="upload-panel-title">Upload dine egne svar</h4>
+              <p>Upload en JSON-fil i Altingets format med <code>Answers</code> og eventuelt <code>Importants</code>. Svar skal ligge som <code>1, 2, 4, 5</code>.</p>
+            </div>
+            <div class="upload-actions">
+              <label class="upload-button" for="answers-upload-input">Upload JSON</label>
+              <input id="answers-upload-input" class="upload-input" type="file" accept=".json,application/json,text/plain">
+              <button type="button" id="clear-upload-button" class="filter-button" disabled>Fjern profil</button>
+            </div>
+            <p id="upload-status" class="upload-status">Ingen profil uploadet endnu.</p>
           </div>
           <div id="party-filter" class="party-filter" aria-label="Partifilter"></div>
           <div id="candidate-chart" class="plot-frame"></div>
@@ -1629,6 +1663,95 @@ h1 {
   max-width: 60ch;
 }
 
+.upload-panel {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) auto;
+  gap: 16px 18px;
+  align-items: center;
+  margin-bottom: 14px;
+  padding: 16px 0 14px;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.upload-kicker {
+  margin: 0 0 6px;
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.upload-copy h4 {
+  margin: 0 0 6px;
+  font-size: 1.05rem;
+}
+
+.upload-copy p {
+  margin: 0;
+  color: var(--muted);
+  max-width: 72ch;
+}
+
+.upload-copy code {
+  font-family: "SFMono-Regular", "Menlo", monospace;
+  font-size: 0.9em;
+}
+
+.upload-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.upload-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 42px;
+  padding: 9px 14px;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--ink);
+  cursor: pointer;
+  font: inherit;
+  text-decoration: none;
+}
+
+.upload-button:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.upload-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.upload-status {
+  grid-column: 1 / -1;
+  margin: 0;
+  padding-top: 10px;
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
+.upload-status.is-success {
+  color: var(--accent);
+}
+
+.upload-status.is-error {
+  color: var(--warm);
+}
+
 .filter-actions {
   display: flex;
   gap: 8px;
@@ -1769,6 +1892,14 @@ h1 {
     flex-direction: column;
   }
 
+  .upload-panel {
+    grid-template-columns: 1fr;
+  }
+
+  .upload-actions {
+    justify-content: flex-start;
+  }
+
   .scope-controls {
     justify-self: stretch;
     width: 100%;
@@ -1818,6 +1949,9 @@ const explainedVarianceChartEl = document.getElementById("explained-variance-cha
 const filterEl = document.getElementById("party-filter");
 const municipalitySelectEl = document.getElementById("municipality-select");
 const municipalitySummaryEl = document.getElementById("municipality-summary");
+const answersUploadInputEl = document.getElementById("answers-upload-input");
+const clearUploadButtonEl = document.getElementById("clear-upload-button");
+const uploadStatusEl = document.getElementById("upload-status");
 const partySectionCopyEl = document.getElementById("party-section-copy");
 const figureSectionCopyEl = document.getElementById("figure-section-copy");
 const tablePc1NegEl = document.getElementById("table-pc1-neg");
@@ -1830,6 +1964,7 @@ let siteData = null;
 let activeParties = new Set();
 let axisRanges = null;
 let selectedMunicipality = "__all__";
+let uploadedProfile = null;
 
 const ALL_MUNICIPALITIES = "__all__";
 const TABLE_LIMIT = 5;
@@ -1856,6 +1991,169 @@ function sampleStd(values) {
 
 function formatNumber(value) {
   return Number(value).toFixed(2);
+}
+
+function updateUploadStatus(message, tone = "") {
+  uploadStatusEl.textContent = message;
+  uploadStatusEl.classList.remove("is-success", "is-error");
+  if (tone) {
+    uploadStatusEl.classList.add(tone);
+  }
+}
+
+function setUploadButtonState() {
+  clearUploadButtonEl.disabled = !uploadedProfile;
+}
+
+function currentAxisRanges() {
+  if (!axisRanges) {
+    return null;
+  }
+  if (!uploadedProfile) {
+    return axisRanges;
+  }
+  const xPad = Math.max((axisRanges.x[1] - axisRanges.x[0]) * 0.04, 0.35);
+  const yPad = Math.max((axisRanges.y[1] - axisRanges.y[0]) * 0.04, 0.35);
+  return {
+    x: [
+      Math.min(axisRanges.x[0], uploadedProfile.PC1 - xPad),
+      Math.max(axisRanges.x[1], uploadedProfile.PC1 + xPad)
+    ],
+    y: [
+      Math.min(axisRanges.y[0], uploadedProfile.PC2 - yPad),
+      Math.max(axisRanges.y[1], uploadedProfile.PC2 + yPad)
+    ]
+  };
+}
+
+function parseJsonAnswerRows(text) {
+  let payload = null;
+  try {
+    payload = JSON.parse(text);
+  } catch (error) {
+    throw new Error("JSON-filen kunne ikke læses.");
+  }
+  const answers = payload && typeof payload === "object" && !Array.isArray(payload)
+    ? (payload.Answers && typeof payload.Answers === "object" ? payload.Answers : payload)
+    : null;
+  if (!answers || Array.isArray(answers)) {
+    throw new Error("JSON-filen skal indeholde et objekt med Answers.");
+  }
+  return Object.entries(answers).map(([questionId, answer]) => ({
+    question_id: questionId,
+    answer: answer == null ? "" : String(answer)
+  }));
+}
+
+function parseAnswerRows(text) {
+  const cleaned = text.replace(/^\\uFEFF/, "").trim();
+  if (!cleaned) {
+    throw new Error("Filen er tom.");
+  }
+  if (!cleaned.startsWith("{")) {
+    throw new Error("Upload en JSON-fil i Altingets format.");
+  }
+  return parseJsonAnswerRows(cleaned);
+}
+
+function normalizeAnswerValue(rawValue) {
+  const trimmed = String(rawValue || "").trim();
+  if (!trimmed) {
+    return null;
+  }
+  const normalized = trimmed.replace(",", ".");
+  const numericValue = Number(normalized);
+  if (Number.isNaN(numericValue)) {
+    throw new Error(`Ugyldigt svar "${trimmed}".`);
+  }
+  const mapped = siteData.model.answer_map[String(Math.trunc(numericValue))];
+  if (mapped !== undefined && Number.isInteger(numericValue)) {
+    return Number(mapped);
+  }
+  if ([-2, -1, 1, 2].includes(numericValue)) {
+    return numericValue;
+  }
+  throw new Error(`Svaret "${trimmed}" er ikke understøttet.`);
+}
+
+function profileTrace(profile) {
+  return {
+    type: "scatter",
+    mode: "markers+text",
+    name: "Dig",
+    x: [profile.PC1],
+    y: [profile.PC2],
+    text: ["Dig"],
+    textposition: "top center",
+    textfont: {
+      size: 14,
+      color: "#201b17",
+      family: "Avenir Next, Segoe UI, sans-serif"
+    },
+    marker: {
+      size: 19,
+      color: "#201b17",
+      symbol: "star-diamond",
+      line: { color: "#fffdf8", width: 1.4 }
+    },
+    hovertemplate:
+      "<b>Din profil</b><br>" +
+      "PC1: %{x:.2f}<br>" +
+      "PC2: %{y:.2f}<br>" +
+      "PC3: " + formatNumber(profile.PC3) + "<br>" +
+      "PC4: " + formatNumber(profile.PC4) + "<br>" +
+      "Besvarede spørgsmål: " + profile.answeredQuestions + "<extra></extra>"
+  };
+}
+
+function projectUploadedAnswers(rows) {
+  const questionIds = siteData.model.question_ids || [];
+  const lookup = new Map();
+  for (const row of rows) {
+    const questionId = Number.parseInt(String(row.question_id || "").trim(), 10);
+    if (!Number.isFinite(questionId)) {
+      continue;
+    }
+    const normalizedAnswer = normalizeAnswerValue(row.answer);
+    if (normalizedAnswer === null) {
+      continue;
+    }
+    lookup.set(questionId, normalizedAnswer);
+  }
+
+  const answerVector = [];
+  let answeredQuestions = 0;
+  for (let index = 0; index < questionIds.length; index += 1) {
+    const questionId = questionIds[index];
+    const answer = lookup.get(questionId);
+    if (answer === undefined) {
+      answerVector.push(Number(siteData.model.imputer_statistics[index]));
+      continue;
+    }
+    answerVector.push(answer);
+    answeredQuestions += 1;
+  }
+
+  if (!answeredQuestions) {
+    throw new Error("Filen indeholder ingen gyldige svar.");
+  }
+
+  const standardized = answerVector.map((value, index) => {
+    const scale = Number(siteData.model.scaler_scale[index]) || 1;
+    return (value - Number(siteData.model.scaler_mean[index])) / scale;
+  });
+  const centered = standardized.map((value, index) => value - Number(siteData.model.pca_mean[index] || 0));
+  const scores = siteData.model.pca_components.map((component) =>
+    component.reduce((sum, weight, index) => sum + centered[index] * Number(weight), 0)
+  );
+
+  return {
+    PC1: scores[0] || 0,
+    PC2: scores[1] || 0,
+    PC3: scores[2] || 0,
+    PC4: scores[3] || 0,
+    answeredQuestions
+  };
 }
 
 function selectedMunicipalityRecord() {
@@ -2094,6 +2392,7 @@ function centroidTrace(rows) {
 }
 
 function baseLayout(title, xTitle, yTitle) {
+  const ranges = currentAxisRanges();
   return {
     title: { text: title, x: 0.02, xanchor: "left", font: { family: "Iowan Old Style, Georgia, serif", size: 22, color: "#201b17" } },
     paper_bgcolor: "#ffffff",
@@ -2101,7 +2400,7 @@ function baseLayout(title, xTitle, yTitle) {
     margin: { l: 58, r: 24, t: 56, b: 56 },
     xaxis: {
       title: xTitle,
-      range: axisRanges ? axisRanges.x : undefined,
+      range: ranges ? ranges.x : undefined,
       zeroline: true,
       zerolinecolor: "rgba(32,27,23,0.25)",
       gridcolor: "rgba(32,27,23,0.09)",
@@ -2109,7 +2408,7 @@ function baseLayout(title, xTitle, yTitle) {
     },
     yaxis: {
       title: yTitle,
-      range: axisRanges ? axisRanges.y : undefined,
+      range: ranges ? ranges.y : undefined,
       zeroline: true,
       zerolinecolor: "rgba(32,27,23,0.25)",
       gridcolor: "rgba(32,27,23,0.09)",
@@ -2159,14 +2458,14 @@ function emptyStateLayout(title, message) {
 function updateScopeCopy() {
   if (selectedMunicipality === ALL_MUNICIPALITIES) {
     partySectionCopyEl.textContent = "Tabellerne viser partiernes gennemsnitlige placering i PCA-rummet og hvilke partier der spænder mest internt på landsplan.";
-    figureSectionCopyEl.textContent = "De vigtigste PCA-figurer er gjort interaktive. Filtrér partier, vælg kommune, og hold musen over en kandidat for at se navn, parti og placering.";
+    figureSectionCopyEl.textContent = "De vigtigste PCA-figurer er gjort interaktive. Filtrér partier, vælg kommune, upload dine egne svar, og hold musen over en kandidat for at se navn, parti og placering.";
     return;
   }
   const municipality = selectedMunicipalityRecord();
   const scopeCount = municipality ? municipality.small_constituencies.length : 0;
   const constituencyLabel = scopeCount === 1 ? "opstillingskreds" : "opstillingskredse";
   partySectionCopyEl.textContent = `Tabellerne viser partiernes gennemsnitlige placering og interne spænd blandt kandidater, der står på stemmesedlen i ${selectedMunicipality}.`;
-  figureSectionCopyEl.textContent = `De interaktive figurer viser kun kandidater, der står på stemmesedlen i ${selectedMunicipality} på tværs af ${scopeCount} ${constituencyLabel}.`;
+  figureSectionCopyEl.textContent = `De interaktive figurer viser kun kandidater, der står på stemmesedlen i ${selectedMunicipality} på tværs af ${scopeCount} ${constituencyLabel}, og kan suppleres med din egen profil.`;
 }
 
 function updateMunicipalitySummary(rows, centroids) {
@@ -2292,18 +2591,57 @@ function renderCandidateTable() {
   );
 }
 
+function renderUploadedProfileStatus() {
+  if (!uploadedProfile) {
+    updateUploadStatus("Ingen profil uploadet endnu.");
+    return;
+  }
+  updateUploadStatus(
+    `Din profil er lagt ind: ${uploadedProfile.answeredQuestions} svar, PC1 ${formatNumber(uploadedProfile.PC1)}, PC2 ${formatNumber(uploadedProfile.PC2)}.`,
+    "is-success"
+  );
+}
+
+async function handleAnswersUpload(file) {
+  try {
+    const rawText = await file.text();
+    const parsedRows = parseAnswerRows(rawText);
+    uploadedProfile = projectUploadedAnswers(parsedRows);
+    setUploadButtonState();
+    renderUploadedProfileStatus();
+    renderCandidateChart();
+    renderCentroidChart();
+  } catch (error) {
+    uploadedProfile = null;
+    setUploadButtonState();
+    updateUploadStatus(error instanceof Error ? error.message : "Kunne ikke læse svarfilen.", "is-error");
+    renderCandidateChart();
+    renderCentroidChart();
+  } finally {
+    answersUploadInputEl.value = "";
+  }
+}
+
 function renderCandidateChart() {
   const grouped = groupBy(visibleCandidateRows(), "party_name");
   const traces = Array.from(grouped.entries())
     .sort((a, b) => a[0].localeCompare(b[0], "da"))
     .map(([partyName, rows]) => candidateTrace(partyName, rows));
+  if (uploadedProfile) {
+    traces.push(profileTrace(uploadedProfile));
+  }
   const layout = traces.length
     ? baseLayout(
         titleWithMunicipality("Kandidater farvet efter parti"),
         `PC1 (${siteData.summary.pc1_pct.toFixed(1)}% forklaret variation)`,
         `PC2 (${siteData.summary.pc2_pct.toFixed(1)}% forklaret variation)`
       )
-    : emptyStateLayout("Kandidater farvet efter parti", "Vælg mindst ét parti for at vise kandidaterne i den valgte kommune.");
+    : emptyStateLayout(
+        "Kandidater farvet efter parti",
+        uploadedProfile
+          ? "Din profil vises alene, fordi alle partier er skjult i den aktuelle visning."
+          : "Vælg mindst ét parti for at vise kandidaterne i den valgte kommune."
+      );
 
   Plotly.react(
     candidateChartEl,
@@ -2316,13 +2654,21 @@ function renderCandidateChart() {
 function renderCentroidChart() {
   const rows = buildCentroids(visibleCandidateRows());
   const traces = rows.length ? [centroidTrace(rows)] : [];
+  if (uploadedProfile) {
+    traces.push(profileTrace(uploadedProfile));
+  }
   const layout = traces.length
     ? baseLayout(
         titleWithMunicipality("Partiernes gennemsnitlige placering"),
         `PC1 (${siteData.summary.pc1_pct.toFixed(1)}%)`,
         `PC2 (${siteData.summary.pc2_pct.toFixed(1)}%)`
       )
-    : emptyStateLayout("Partiernes gennemsnitlige placering", "Vælg mindst ét parti for at vise particentroiderne i den valgte kommune.");
+    : emptyStateLayout(
+        "Partiernes gennemsnitlige placering",
+        uploadedProfile
+          ? "Din profil vises alene, fordi alle partier er skjult i den aktuelle visning."
+          : "Vælg mindst ét parti for at vise particentroiderne i den valgte kommune."
+      );
   Plotly.react(
     centroidChartEl,
     traces,
@@ -2427,11 +2773,31 @@ function boot() {
   buildMunicipalityOptions(siteData.municipalities.slice().sort((a, b) => a.name.localeCompare(b.name, "da")));
   syncPartyControls(true);
   renderExplainedVarianceChart();
+  renderUploadedProfileStatus();
+  setUploadButtonState();
 
   municipalitySelectEl.addEventListener("change", () => {
     selectedMunicipality = municipalitySelectEl.value;
     syncPartyControls(true);
     renderAll();
+  });
+
+  answersUploadInputEl.addEventListener("change", async (event) => {
+    const file = event.target.files && event.target.files[0];
+    if (!file) {
+      return;
+    }
+    updateUploadStatus(`Indlæser ${file.name} ...`);
+    await handleAnswersUpload(file);
+  });
+
+  clearUploadButtonEl.addEventListener("click", () => {
+    uploadedProfile = null;
+    answersUploadInputEl.value = "";
+    setUploadButtonState();
+    renderUploadedProfileStatus();
+    renderCandidateChart();
+    renderCentroidChart();
   });
 
   document.querySelector('[data-filter-action="all"]').addEventListener("click", () => {
@@ -2474,7 +2840,7 @@ def main() -> None:
         questions_df["question_id"].tolist(),
     )
 
-    scores_df, loadings_df, party_centroids, variance_df = run_pca(candidates_df, answers_wide, questions_df)
+    scores_df, loadings_df, party_centroids, variance_df, model_payload = run_pca(candidates_df, answers_wide, questions_df)
     render_figures(scores_df, loadings_df, party_centroids, variance_df)
     render_site(
         election,
@@ -2484,6 +2850,7 @@ def main() -> None:
         loadings_df,
         party_centroids,
         variance_df,
+        model_payload,
         questions_df,
         question_consistency_df,
         big_constituencies,
