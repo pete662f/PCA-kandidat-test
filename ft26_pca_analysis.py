@@ -730,14 +730,6 @@ def render_figures(
     fig.savefig(FIG_DIR / "explained_variance.png", dpi=200)
     plt.close(fig)
 
-
-def write_answer_template(questions_df: pd.DataFrame) -> None:
-    template_df = questions_df[["question_id", "topic", "question"]].copy()
-    template_df.insert(1, "answer", "")
-    template_df["accepted_values"] = "1, 2, 4, 5 eller -2, -1, 1, 2"
-    template_df.to_csv(DATA_DIR / "own_answers_template.tsv", sep="\t", index=False)
-
-
 def format_pct(value: float) -> str:
     return f"{value:.1f}%"
 
@@ -1161,12 +1153,11 @@ def render_site(
             <div class="upload-copy">
               <p class="upload-kicker">Placér dig selv</p>
               <h4 id="upload-panel-title">Upload dine egne svar</h4>
-              <p>Accepterer både Altingets JSON-format med <code>Answers</code> og en udfyldt TSV/CSV-skabelon. Svar kan være <code>1, 2, 4, 5</code> eller den omsatte skala <code>-2, -1, 1, 2</code>.</p>
+              <p>Upload en JSON-fil i Altingets format med <code>Answers</code> og eventuelt <code>Importants</code>. Svar skal ligge som <code>1, 2, 4, 5</code>.</p>
             </div>
             <div class="upload-actions">
-              <a class="upload-link" href="../data/own_answers_template.tsv" download>Hent svarskabelon</a>
-              <label class="upload-button" for="answers-upload-input">Upload svarfil</label>
-              <input id="answers-upload-input" class="upload-input" type="file" accept=".json,.tsv,.csv,application/json,text/tab-separated-values,text/csv,text/plain">
+              <label class="upload-button" for="answers-upload-input">Upload JSON</label>
+              <input id="answers-upload-input" class="upload-input" type="file" accept=".json,application/json,text/plain">
               <button type="button" id="clear-upload-button" class="filter-button" disabled>Fjern profil</button>
             </div>
             <p id="upload-status" class="upload-status">Ingen profil uploadet endnu.</p>
@@ -1205,7 +1196,6 @@ def render_site(
         <div class="download-grid">
           <a class="download-card" href="../data/candidates.csv">Kandidatmetadata</a>
           <a class="download-card" href="../data/answers_wide.csv">Svarmatrix</a>
-          <a class="download-card" href="../data/own_answers_template.tsv">Svarskabelon</a>
           <a class="download-card" href="../data/candidate_pca_scores.csv">Kandidat-scorer</a>
           <a class="download-card" href="../data/question_loadings.csv">Question loadings</a>
           <a class="download-card" href="../data/party_centroids.csv">Particentroider</a>
@@ -1715,7 +1705,6 @@ h1 {
   gap: 10px;
 }
 
-.upload-link,
 .upload-button {
   display: inline-flex;
   align-items: center;
@@ -1730,7 +1719,6 @@ h1 {
   text-decoration: none;
 }
 
-.upload-link:hover,
 .upload-button:hover {
   border-color: var(--accent);
   color: var(--accent);
@@ -2038,42 +2026,6 @@ function currentAxisRanges() {
   };
 }
 
-function detectDelimiter(text) {
-  const firstLine = text.split(/\\r?\\n/, 1)[0] || "";
-  const tabCount = (firstLine.match(/\\t/g) || []).length;
-  const semicolonCount = (firstLine.match(/;/g) || []).length;
-  const commaCount = (firstLine.match(/,/g) || []).length;
-  if (tabCount >= semicolonCount && tabCount >= commaCount) return "\\t";
-  if (semicolonCount > commaCount) return ";";
-  return ",";
-}
-
-function parseDelimitedLine(line, delimiter) {
-  const values = [];
-  let current = "";
-  let inQuotes = false;
-  for (let index = 0; index < line.length; index += 1) {
-    const char = line[index];
-    if (char === '"') {
-      if (inQuotes && line[index + 1] === '"') {
-        current += '"';
-        index += 1;
-      } else {
-        inQuotes = !inQuotes;
-      }
-      continue;
-    }
-    if (char === delimiter && !inQuotes) {
-      values.push(current);
-      current = "";
-      continue;
-    }
-    current += char;
-  }
-  values.push(current);
-  return values.map((value) => value.trim());
-}
-
 function parseJsonAnswerRows(text) {
   let payload = null;
   try {
@@ -2098,27 +2050,10 @@ function parseAnswerRows(text) {
   if (!cleaned) {
     throw new Error("Filen er tom.");
   }
-  if (cleaned.startsWith("{")) {
-    return parseJsonAnswerRows(cleaned);
+  if (!cleaned.startsWith("{")) {
+    throw new Error("Upload en JSON-fil i Altingets format.");
   }
-  const delimiter = detectDelimiter(cleaned);
-  const lines = cleaned.split(/\\r?\\n/).filter((line) => line.trim().length);
-  if (lines.length < 2) {
-    throw new Error("Filen mangler svarrækker.");
-  }
-  const headers = parseDelimitedLine(lines[0], delimiter).map((value) => value.toLowerCase());
-  const questionIdIndex = headers.indexOf("question_id");
-  const answerIndex = headers.findIndex((value) => ["answer", "mapped_answer", "raw_answer"].includes(value));
-  if (questionIdIndex === -1 || answerIndex === -1) {
-    throw new Error("Filen skal indeholde kolonnerne question_id og answer.");
-  }
-  return lines.slice(1).map((line) => {
-    const columns = parseDelimitedLine(line, delimiter);
-    return {
-      question_id: columns[questionIdIndex] || "",
-      answer: columns[answerIndex] || ""
-    };
-  });
+  return parseJsonAnswerRows(cleaned);
 }
 
 function normalizeAnswerValue(rawValue) {
@@ -2907,7 +2842,6 @@ def main() -> None:
 
     scores_df, loadings_df, party_centroids, variance_df, model_payload = run_pca(candidates_df, answers_wide, questions_df)
     render_figures(scores_df, loadings_df, party_centroids, variance_df)
-    write_answer_template(questions_df)
     render_site(
         election,
         candidates_df,
