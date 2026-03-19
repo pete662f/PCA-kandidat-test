@@ -1195,7 +1195,10 @@ def build_summary(
         "question_set_deviations": int((~question_consistency_df["same_as_common_set"]).sum()),
         "pc1_pct": float(variance_df.iloc[0]["explained_variance_pct"]),
         "pc2_pct": float(variance_df.iloc[1]["explained_variance_pct"]),
+        "pc3_pct": float(variance_df.iloc[2]["explained_variance_pct"]),
+        "pc4_pct": float(variance_df.iloc[3]["explained_variance_pct"]),
         "pc12_pct": float(variance_df.iloc[1]["cumulative_explained_variance_pct"]),
+        "pc1234_pct": float(variance_df.iloc[3]["cumulative_explained_variance_pct"]),
     }
 
 
@@ -1225,6 +1228,8 @@ def render_site(
     )
     _, pc1_negative, pc1_positive = component_copy("PC1", variance_df, loadings_df, party_centroids)
     _, pc2_negative, pc2_positive = component_copy("PC2", variance_df, loadings_df, party_centroids)
+    _, pc3_negative, pc3_positive = component_copy("PC3", variance_df, loadings_df, party_centroids)
+    _, pc4_negative, pc4_positive = component_copy("PC4", variance_df, loadings_df, party_centroids)
     color_map = party_color_map(party_centroids)
     municipality_payload = municipalities
 
@@ -1277,6 +1282,10 @@ def render_site(
         "pc1_positive": pc1_positive,
         "pc2_negative": pc2_negative,
         "pc2_positive": pc2_positive,
+        "pc3_negative": pc3_negative,
+        "pc3_positive": pc3_positive,
+        "pc4_negative": pc4_negative,
+        "pc4_positive": pc4_positive,
     }
 
     site_payload = {
@@ -1409,8 +1418,8 @@ def render_site(
 
       <section id="dimensions" class="section">
         <div class="section-head">
-          <h2>De to vigtigste dimensioner</h2>
-          <p>PC1 og PC2 forklarer tilsammen {summary['pc12_pct']:.1f}% af variationen. Fortolkningen nedenfor er genereret direkte fra de stærkeste loadings og partiernes centroidplaceringer.</p>
+          <h2>De fire vigtigste dimensioner</h2>
+          <p>PC1 til PC4 forklarer tilsammen {summary['pc1234_pct']:.1f}% af variationen. Fortolkningerne nedenfor er genereret direkte fra de stærkeste loadings og partiernes centroidplaceringer.</p>
         </div>
 
         <div class="variance-grid">
@@ -1437,6 +1446,28 @@ def render_site(
             <div class="question-columns">
               {loading_list("Negativ side", pc2_negative, "negative")}
               {loading_list("Positiv side", pc2_positive, "positive")}
+            </div>
+          </article>
+
+          <article class="dimension-card">
+            <div class="dimension-topline">
+              <span>PC3</span>
+              <strong>{summary['pc3_pct']:.1f}% af variationen</strong>
+            </div>
+            <div class="question-columns">
+              {loading_list("Negativ side", pc3_negative, "negative")}
+              {loading_list("Positiv side", pc3_positive, "positive")}
+            </div>
+          </article>
+
+          <article class="dimension-card">
+            <div class="dimension-topline">
+              <span>PC4</span>
+              <strong>{summary['pc4_pct']:.1f}% af variationen</strong>
+            </div>
+            <div class="question-columns">
+              {loading_list("Negativ side", pc4_negative, "negative")}
+              {loading_list("Positiv side", pc4_positive, "positive")}
             </div>
           </article>
         </div>
@@ -1518,11 +1549,31 @@ def render_site(
         <section class="interactive-block">
           <div class="interactive-head">
             <div>
+              <h3>Kandidater i PC3/PC4-rummet</h3>
+              <p>Samme felt vist på de tredje og fjerde komponenter, med de samme filtre, profiler og markering af partiformænd.</p>
+            </div>
+          </div>
+          <div id="candidate-chart-34" class="plot-frame"></div>
+        </section>
+
+        <section class="interactive-block">
+          <div class="interactive-head">
+            <div>
               <h3>Particentroider</h3>
               <p>Hvert punkt er et partis gennemsnitsplacering. Krydsene viser spredningen i partiets kandidater på PC1 og PC2.</p>
             </div>
           </div>
           <div id="centroid-chart" class="plot-frame"></div>
+        </section>
+
+        <section class="interactive-block">
+          <div class="interactive-head">
+            <div>
+              <h3>Particentroider i PC3/PC4</h3>
+              <p>Samme gennemsnitsplaceringer vist på tredje og fjerde komponent, inklusive spredning blandt kandidaterne på de to akser.</p>
+            </div>
+          </div>
+          <div id="centroid-chart-34" class="plot-frame"></div>
         </section>
 
         <section class="interactive-block">
@@ -2328,7 +2379,9 @@ h1 {
     (SITE_DIR / "app.js").write_text(
         """
 const candidateChartEl = document.getElementById("candidate-chart");
+const candidateChart34El = document.getElementById("candidate-chart-34");
 const centroidChartEl = document.getElementById("centroid-chart");
+const centroidChart34El = document.getElementById("centroid-chart-34");
 const explainedVarianceChartEl = document.getElementById("explained-variance-chart");
 const filterEl = document.getElementById("party-filter");
 const municipalitySelectEl = document.getElementById("municipality-select");
@@ -2390,25 +2443,30 @@ function setUploadButtonState() {
   clearUploadButtonEl.disabled = !uploadedProfiles.length;
 }
 
-function currentAxisRanges() {
+function currentAxisRanges(xKey, yKey) {
   if (!axisRanges) {
     return null;
   }
-  if (!uploadedProfiles.length) {
-    return axisRanges;
+  const key = `${xKey}_${yKey}`;
+  const baseRanges = axisRanges[key];
+  if (!baseRanges) {
+    return null;
   }
-  const xPad = Math.max((axisRanges.x[1] - axisRanges.x[0]) * 0.04, 0.35);
-  const yPad = Math.max((axisRanges.y[1] - axisRanges.y[0]) * 0.04, 0.35);
-  const profileXs = uploadedProfiles.map((profile) => profile.PC1);
-  const profileYs = uploadedProfiles.map((profile) => profile.PC2);
+  if (!uploadedProfiles.length) {
+    return baseRanges;
+  }
+  const xPad = Math.max((baseRanges.x[1] - baseRanges.x[0]) * 0.04, 0.35);
+  const yPad = Math.max((baseRanges.y[1] - baseRanges.y[0]) * 0.04, 0.35);
+  const profileXs = uploadedProfiles.map((profile) => profile[xKey]);
+  const profileYs = uploadedProfiles.map((profile) => profile[yKey]);
   return {
     x: [
-      Math.min(axisRanges.x[0], ...profileXs.map((value) => value - xPad)),
-      Math.max(axisRanges.x[1], ...profileXs.map((value) => value + xPad))
+      Math.min(baseRanges.x[0], ...profileXs.map((value) => value - xPad)),
+      Math.max(baseRanges.x[1], ...profileXs.map((value) => value + xPad))
     ],
     y: [
-      Math.min(axisRanges.y[0], ...profileYs.map((value) => value - yPad)),
-      Math.max(axisRanges.y[1], ...profileYs.map((value) => value + yPad))
+      Math.min(baseRanges.y[0], ...profileYs.map((value) => value - yPad)),
+      Math.max(baseRanges.y[1], ...profileYs.map((value) => value + yPad))
     ]
   };
 }
@@ -2605,8 +2663,8 @@ function renderUploadedProfilesList() {
       removeUploadedProfile(profile.label);
       setUploadButtonState();
       renderUploadedProfileStatus();
-      renderCandidateChart();
-      renderCentroidChart();
+      renderCandidateCharts();
+      renderCentroidCharts();
     });
 
     copy.append(name, meta);
@@ -2615,13 +2673,13 @@ function renderUploadedProfilesList() {
   }
 }
 
-function profileTrace(profile) {
+function profileTrace(profile, xKey, yKey, xLabel, yLabel) {
   return {
     type: "scatter",
     mode: "markers+text",
     name: profile.label,
-    x: [profile.PC1],
-    y: [profile.PC2],
+    x: [profile[xKey]],
+    y: [profile[yKey]],
     text: [profile.label],
     textposition: "top center",
     textfont: {
@@ -2637,8 +2695,8 @@ function profileTrace(profile) {
     },
     hovertemplate:
       "<b>%{text}</b><br>" +
-      "PC1: %{x:.2f}<br>" +
-      "PC2: %{y:.2f}<br>" +
+      `${xLabel}: %{x:.2f}<br>` +
+      `${yLabel}: %{y:.2f}<br>` +
       "PC3: " + formatNumber(profile.PC3) + "<br>" +
       "PC4: " + formatNumber(profile.PC4) + "<extra></extra>"
   };
@@ -2763,18 +2821,24 @@ function buildCentroids(rows) {
       const firstRow = partyRows[0];
       const pc1Values = partyRows.map((row) => row.PC1);
       const pc2Values = partyRows.map((row) => row.PC2);
+      const pc3Values = partyRows.map((row) => row.PC3);
+      const pc4Values = partyRows.map((row) => row.PC4);
       const pc1Sd = sampleStd(pc1Values);
       const pc2Sd = sampleStd(pc2Values);
+      const pc3Sd = sampleStd(pc3Values);
+      const pc4Sd = sampleStd(pc4Values);
       return {
         party_name: partyName,
         party_code: firstRow.party_code || "",
         candidate_count: partyRows.length,
         PC1: mean(pc1Values),
         PC2: mean(pc2Values),
-        PC3: mean(partyRows.map((row) => row.PC3)),
-        PC4: mean(partyRows.map((row) => row.PC4)),
+        PC3: mean(pc3Values),
+        PC4: mean(pc4Values),
         pc1_sd: pc1Sd,
         pc2_sd: pc2Sd,
+        pc3_sd: pc3Sd,
+        pc4_sd: pc4Sd,
         internal_dispersion: Math.sqrt(pc1Sd ** 2 + pc2Sd ** 2),
         color: firstRow.color
       };
@@ -2825,20 +2889,20 @@ function buildPartyControls(parties) {
         activeParties.add(party.party_name);
         button.classList.add("is-active");
       }
-      renderCandidateChart();
-      renderCentroidChart();
+      renderCandidateCharts();
+      renderCentroidCharts();
     });
     filterEl.appendChild(button);
   }
 }
 
-function candidateTrace(partyName, rows) {
+function candidateTrace(partyName, rows, xKey, yKey, xLabel, yLabel) {
   return {
     type: "scattergl",
     mode: "markers",
     name: partyName,
-    x: rows.map((row) => row.PC1),
-    y: rows.map((row) => row.PC2),
+    x: rows.map((row) => row[xKey]),
+    y: rows.map((row) => row[yKey]),
     marker: {
       size: 8,
       color: rows[0].color,
@@ -2855,20 +2919,20 @@ function candidateTrace(partyName, rows) {
     hovertemplate:
       "<b>%{customdata[0]}</b><br>" +
       "%{customdata[2]} · %{customdata[1]}<br>" +
-      "PC1: %{x:.2f}<br>" +
-      "PC2: %{y:.2f}<br>" +
+      `${xLabel}: %{x:.2f}<br>` +
+      `${yLabel}: %{y:.2f}<br>` +
       "PC3: %{customdata[3]:.2f}<br>" +
       "PC4: %{customdata[4]:.2f}<extra></extra>"
   };
 }
 
-function partyLeaderTrace(rows) {
+function partyLeaderTrace(rows, xKey, yKey, xLabel, yLabel) {
   return {
     type: "scatter",
     mode: "markers",
     name: "Partiformænd",
-    x: rows.map((row) => row.PC1),
-    y: rows.map((row) => row.PC2),
+    x: rows.map((row) => row[xKey]),
+    y: rows.map((row) => row[yKey]),
     marker: {
       size: 16,
       color: rows.map((row) => row.color),
@@ -2886,14 +2950,14 @@ function partyLeaderTrace(rows) {
       "<b>Partiformand</b><br>" +
       "%{customdata[2]} · %{customdata[1]}<br>" +
       "%{customdata[0]}<br>" +
-      "PC1: %{x:.2f}<br>" +
-      "PC2: %{y:.2f}<br>" +
+      `${xLabel}: %{x:.2f}<br>` +
+      `${yLabel}: %{y:.2f}<br>` +
       "PC3: %{customdata[3]:.2f}<br>" +
       "PC4: %{customdata[4]:.2f}<extra></extra>"
   };
 }
 
-function centroidTrace(rows) {
+function centroidTrace(rows, xKey, yKey, xSdKey, ySdKey, xLabel, yLabel) {
   const textPositionByCode = {
     "A": "top right",
     "B": "top left",
@@ -2912,8 +2976,8 @@ function centroidTrace(rows) {
   return {
     type: "scatter",
     mode: "markers+text",
-    x: rows.map((row) => row.PC1),
-    y: rows.map((row) => row.PC2),
+    x: rows.map((row) => row[xKey]),
+    y: rows.map((row) => row[yKey]),
     text: rows.map((row) => row.party_code || "?"),
     textposition: rows.map((row) => textPositionByCode[row.party_code || ""] || "top center"),
     textfont: {
@@ -2928,7 +2992,7 @@ function centroidTrace(rows) {
     },
     error_x: {
       type: "data",
-      array: rows.map((row) => row.pc1_sd || 0),
+      array: rows.map((row) => row[xSdKey] || 0),
       visible: true,
       thickness: 1.4,
       width: 0,
@@ -2936,7 +3000,7 @@ function centroidTrace(rows) {
     },
     error_y: {
       type: "data",
-      array: rows.map((row) => row.pc2_sd || 0),
+      array: rows.map((row) => row[ySdKey] || 0),
       visible: true,
       thickness: 1.4,
       width: 0,
@@ -2947,22 +3011,22 @@ function centroidTrace(rows) {
       row.party_code,
       row.candidate_count,
       row.internal_dispersion,
-      row.pc1_sd || 0,
-      row.pc2_sd || 0
+      row[xSdKey] || 0,
+      row[ySdKey] || 0
     ]),
     hovertemplate:
       "<b>%{customdata[1]} · %{customdata[0]}</b><br>" +
-      "PC1: %{x:.2f}<br>" +
-      "PC2: %{y:.2f}<br>" +
-      "Spredning PC1: %{customdata[4]:.2f}<br>" +
-      "Spredning PC2: %{customdata[5]:.2f}<br>" +
+      `${xLabel}: %{x:.2f}<br>` +
+      `${yLabel}: %{y:.2f}<br>` +
+      `Spredning ${xLabel}: %{customdata[4]:.2f}<br>` +
+      `Spredning ${yLabel}: %{customdata[5]:.2f}<br>` +
       "Kandidater i PCA: %{customdata[2]}<br>" +
       "Intern spredning: %{customdata[3]:.2f}<extra></extra>"
   };
 }
 
-function baseLayout(title, xTitle, yTitle) {
-  const ranges = currentAxisRanges();
+function baseLayout(title, xTitle, yTitle, xKey, yKey) {
+  const ranges = currentAxisRanges(xKey, yKey);
   return {
     title: { text: title, x: 0.02, xanchor: "left", font: { family: "Iowan Old Style, Georgia, serif", size: 22, color: "#201b17" } },
     paper_bgcolor: "#ffffff",
@@ -2994,23 +3058,30 @@ function baseLayout(title, xTitle, yTitle) {
   };
 }
 
-function computeAxisRanges() {
-  const xs = siteData.candidates.map((row) => row.PC1);
-  const ys = siteData.candidates.map((row) => row.PC2);
+function computeAxisRangePair(xKey, yKey) {
+  const xs = siteData.candidates.map((row) => row[xKey]);
+  const ys = siteData.candidates.map((row) => row[yKey]);
   const xMin = Math.min(...xs);
   const xMax = Math.max(...xs);
   const yMin = Math.min(...ys);
   const yMax = Math.max(...ys);
   const xPad = Math.max((xMax - xMin) * 0.08, 0.5);
   const yPad = Math.max((yMax - yMin) * 0.08, 0.5);
-  axisRanges = {
+  return {
     x: [xMin - xPad, xMax + xPad],
     y: [yMin - yPad, yMax + yPad]
   };
 }
 
-function emptyStateLayout(title, message) {
-  const layout = baseLayout(titleWithMunicipality(title), `PC1 (${siteData.summary.pc1_pct.toFixed(1)}%)`, `PC2 (${siteData.summary.pc2_pct.toFixed(1)}%)`);
+function computeAxisRanges() {
+  axisRanges = {
+    PC1_PC2: computeAxisRangePair("PC1", "PC2"),
+    PC3_PC4: computeAxisRangePair("PC3", "PC4")
+  };
+}
+
+function emptyStateLayout(title, message, xTitle, yTitle, xKey, yKey) {
+  const layout = baseLayout(titleWithMunicipality(title), xTitle, yTitle, xKey, yKey);
   layout.annotations = [
     {
       text: message,
@@ -3187,8 +3258,8 @@ async function handleAnswersUpload(files) {
   }
   setUploadButtonState();
   renderUploadedProfileStatus();
-  renderCandidateChart();
-  renderCentroidChart();
+  renderCandidateCharts();
+  renderCentroidCharts();
   answersUploadInputEl.value = "";
 
   if (errors.length) {
@@ -3204,58 +3275,112 @@ async function handleAnswersUpload(files) {
   }
 }
 
-function renderCandidateChart() {
+function renderCandidateChart(chartEl, xKey, yKey, title, xTitle, yTitle) {
   const grouped = groupBy(visibleCandidateRows(), "party_name");
   const traces = Array.from(grouped.entries())
     .sort((a, b) => a[0].localeCompare(b[0], "da"))
-    .map(([partyName, rows]) => candidateTrace(partyName, rows));
+    .map(([partyName, rows]) => candidateTrace(partyName, rows, xKey, yKey, xKey, yKey));
   const partyLeaderRows = visibleCandidateRows().filter((row) => row.is_party_leader);
   if (partyLeaderRows.length) {
-    traces.push(partyLeaderTrace(partyLeaderRows));
+    traces.push(partyLeaderTrace(partyLeaderRows, xKey, yKey, xKey, yKey));
   }
-  traces.push(...uploadedProfiles.map((profile) => profileTrace(profile)));
+  traces.push(...uploadedProfiles.map((profile) => profileTrace(profile, xKey, yKey, xKey, yKey)));
   const layout = traces.length
     ? baseLayout(
-        titleWithMunicipality("Kandidater farvet efter parti"),
-        `PC1 (${siteData.summary.pc1_pct.toFixed(1)}% forklaret variation)`,
-        `PC2 (${siteData.summary.pc2_pct.toFixed(1)}% forklaret variation)`
+        titleWithMunicipality(title),
+        xTitle,
+        yTitle,
+        xKey,
+        yKey
       )
     : emptyStateLayout(
-        "Kandidater farvet efter parti",
+        title,
         uploadedProfiles.length
           ? "Profilerne vises alene, fordi alle partier er skjult i den aktuelle visning."
-          : "Vælg mindst ét parti for at vise kandidaterne i den valgte kommune."
+          : "Vælg mindst ét parti for at vise kandidaterne i den valgte kommune.",
+        xTitle,
+        yTitle,
+        xKey,
+        yKey
       );
 
   Plotly.react(
-    candidateChartEl,
+    chartEl,
     traces,
     layout,
     { responsive: true, displayModeBar: false }
   );
 }
 
-function renderCentroidChart() {
+function renderCandidateCharts() {
+  renderCandidateChart(
+    candidateChartEl,
+    "PC1",
+    "PC2",
+    "Kandidater farvet efter parti",
+    `PC1 (${siteData.summary.pc1_pct.toFixed(1)}% forklaret variation)`,
+    `PC2 (${siteData.summary.pc2_pct.toFixed(1)}% forklaret variation)`
+  );
+  renderCandidateChart(
+    candidateChart34El,
+    "PC3",
+    "PC4",
+    "Kandidater farvet efter parti",
+    "PC3",
+    "PC4"
+  );
+}
+
+function renderCentroidChart(chartEl, xKey, yKey, xSdKey, ySdKey, title, xTitle, yTitle) {
   const rows = buildCentroids(visibleCandidateRows());
-  const traces = rows.length ? [centroidTrace(rows)] : [];
-  traces.push(...uploadedProfiles.map((profile) => profileTrace(profile)));
+  const traces = rows.length ? [centroidTrace(rows, xKey, yKey, xSdKey, ySdKey, xKey, yKey)] : [];
+  traces.push(...uploadedProfiles.map((profile) => profileTrace(profile, xKey, yKey, xKey, yKey)));
   const layout = traces.length
     ? baseLayout(
-        titleWithMunicipality("Partiernes gennemsnitlige placering"),
-        `PC1 (${siteData.summary.pc1_pct.toFixed(1)}%)`,
-        `PC2 (${siteData.summary.pc2_pct.toFixed(1)}%)`
+        titleWithMunicipality(title),
+        xTitle,
+        yTitle,
+        xKey,
+        yKey
       )
     : emptyStateLayout(
-        "Partiernes gennemsnitlige placering",
+        title,
         uploadedProfiles.length
           ? "Profilerne vises alene, fordi alle partier er skjult i den aktuelle visning."
-          : "Vælg mindst ét parti for at vise particentroiderne i den valgte kommune."
+          : "Vælg mindst ét parti for at vise particentroiderne i den valgte kommune.",
+        xTitle,
+        yTitle,
+        xKey,
+        yKey
       );
   Plotly.react(
-    centroidChartEl,
+    chartEl,
     traces,
     layout,
     { responsive: true, displayModeBar: false }
+  );
+}
+
+function renderCentroidCharts() {
+  renderCentroidChart(
+    centroidChartEl,
+    "PC1",
+    "PC2",
+    "pc1_sd",
+    "pc2_sd",
+    "Partiernes gennemsnitlige placering",
+    `PC1 (${siteData.summary.pc1_pct.toFixed(1)}%)`,
+    `PC2 (${siteData.summary.pc2_pct.toFixed(1)}%)`
+  );
+  renderCentroidChart(
+    centroidChart34El,
+    "PC3",
+    "PC4",
+    "pc3_sd",
+    "pc4_sd",
+    "Partiernes gennemsnitlige placering",
+    `PC3 (${siteData.summary.pc3_pct.toFixed(1)}%)`,
+    `PC4 (${siteData.summary.pc4_pct.toFixed(1)}%)`
   );
 }
 
@@ -3341,8 +3466,8 @@ function renderAll() {
   updateScopeCopy();
   renderPartyTables();
   renderCandidateTable();
-  renderCandidateChart();
-  renderCentroidChart();
+  renderCandidateCharts();
+  renderCentroidCharts();
 }
 
 function boot() {
@@ -3378,22 +3503,22 @@ function boot() {
     answersUploadInputEl.value = "";
     setUploadButtonState();
     renderUploadedProfileStatus();
-    renderCandidateChart();
-    renderCentroidChart();
+    renderCandidateCharts();
+    renderCentroidCharts();
   });
 
   document.querySelector('[data-filter-action="all"]').addEventListener("click", () => {
     activeParties = new Set(buildCentroids(municipalityRows()).map((party) => party.party_name));
     document.querySelectorAll(".party-toggle").forEach((el) => el.classList.add("is-active"));
-    renderCandidateChart();
-    renderCentroidChart();
+    renderCandidateCharts();
+    renderCentroidCharts();
   });
 
   document.querySelector('[data-filter-action="none"]').addEventListener("click", () => {
     activeParties = new Set();
     document.querySelectorAll(".party-toggle").forEach((el) => el.classList.remove("is-active"));
-    renderCandidateChart();
-    renderCentroidChart();
+    renderCandidateCharts();
+    renderCentroidCharts();
   });
 
   renderAll();
