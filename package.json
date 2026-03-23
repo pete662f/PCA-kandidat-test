@@ -1,0 +1,19 @@
+{
+  "name": "pca-kandidat-test",
+  "version": "1.0.0",
+  "description": "PCA-based Danish candidate test analyzer — web app with LLM API",
+  "type": "module",
+  "scripts": {
+    "dev": "bun run --watch src/index.ts",
+    "start": "bun run src/index.ts",
+    "build": "bun build src/index.ts --outdir dist --target bun"
+  },
+  "dependencies": {
+    "hono": "^4.7.0",
+    "ml-matrix": "^6.12.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "typescript": "^5.7.0"
+  }
+}
