@@ -26,6 +26,11 @@ apiRouter.get("/sources", (c) => {
         party_count: bundle.partyCentroids.length,
       };
     }),
+    usage: {
+      step_1: "GET /api/questions?source=<slug> — hent alle spørgsmål",
+      step_2: "POST /api/take-test — indsend svar og få resultat + upload-fil",
+      step_3: "Upload den returnerede upload_file JSON på hjemmesiden for at se din profil i grafen",
+    },
   });
 });
 
@@ -53,6 +58,29 @@ apiRouter.get("/questions", (c) => {
       "0": "Neutral / spring over (skip)",
       "1": "Enig (agree)",
       "2": "Helt enig (strongly agree)",
+    },
+    how_to_answer: {
+      description:
+        "Besvar alle spørgsmål og send dem via POST /api/take-test. Svaret indeholder din PCA-position, nærmeste partier, nærmeste kandidater, samt en upload-fil du kan uploade på hjemmesiden.",
+      example_request: {
+        method: "POST",
+        url: "/api/take-test",
+        headers: { "Content-Type": "application/json" },
+        body: {
+          source,
+          label: "Mit navn",
+          answers: [
+            {
+              question_id: bundle.questions[0]?.questionId ?? "example-id",
+              answer: 2,
+            },
+            {
+              question_id: bundle.questions[1]?.questionId ?? "example-id-2",
+              answer: -1,
+            },
+          ],
+        },
+      },
     },
     questions: bundle.questions.map((q) => ({
       question_id: q.questionId,
@@ -138,11 +166,28 @@ apiRouter.get("/candidates", (c) => {
 // ── POST /api/take-test ──
 
 apiRouter.post("/take-test", async (c) => {
-  let body: ApiTakeTestRequest;
+  let body: ApiTakeTestRequest & { label?: string };
   try {
     body = await c.req.json();
   } catch {
-    return c.json({ error: "Invalid JSON body." }, 400);
+    return c.json(
+      {
+        error: "Invalid JSON body.",
+        usage: {
+          method: "POST",
+          url: "/api/take-test",
+          content_type: "application/json",
+          body: {
+            source: "tv2",
+            label: "Mit navn (valgfrit — bruges som navn i grafen)",
+            answers: [
+              { question_id: "<question_id fra GET /api/questions>", answer: "<-2 | -1 | 0 | 1 | 2>" },
+            ],
+          },
+        },
+      },
+      400
+    );
   }
 
   const source = body.source ?? getAvailableSources()[0];
@@ -153,27 +198,38 @@ apiRouter.post("/take-test", async (c) => {
   if (!body.answers || !Array.isArray(body.answers) || body.answers.length === 0) {
     return c.json(
       {
-        error:
-          'Missing or empty "answers" array. Provide at least one answer.',
+        error: 'Manglende eller tom "answers"-array. Angiv mindst ét svar.',
+        usage: {
+          description: "Hent spørgsmål med GET /api/questions?source=" + source + " og send svarene her.",
+          body: {
+            source,
+            label: "Mit navn (valgfrit)",
+            answers: [
+              { question_id: bundle.questions[0]?.questionId ?? "...", answer: 2 },
+              { question_id: bundle.questions[1]?.questionId ?? "...", answer: -1 },
+            ],
+          },
+        },
       },
       400
     );
   }
 
-  // Parse answers into a Map
+  // Parse answers into a Map + build upload file
   const answerMap = new Map<string, number>();
+  const uploadAnswers: Record<string, number> = {};
   const errors: string[] = [];
 
   for (const a of body.answers) {
     const qid = String(a.question_id ?? "").trim();
     if (!qid) {
-      errors.push(`Missing question_id in answer: ${JSON.stringify(a)}`);
+      errors.push(`Manglende question_id i svar: ${JSON.stringify(a)}`);
       continue;
     }
 
     // Validate question exists
     if (!bundle.model.questionIds.includes(qid)) {
-      errors.push(`Unknown question_id: "${qid}"`);
+      errors.push(`Ukendt question_id: "${qid}"`);
       continue;
     }
 
@@ -184,18 +240,16 @@ apiRouter.post("/take-test", async (c) => {
     } else {
       const parsed = parseFloat(String(a.answer));
       if (isNaN(parsed)) {
-        // Try answer map (1,2,4,5 → -2,-1,1,2)
         const intVal = parseInt(String(a.answer));
         if (ANSWER_MAP[intVal] !== undefined) {
           value = ANSWER_MAP[intVal];
         } else {
           errors.push(
-            `Invalid answer value for question ${qid}: "${a.answer}"`
+            `Ugyldigt svar for spørgsmål ${qid}: "${a.answer}"`
           );
           continue;
         }
       } else {
-        // Check if it's on the 1,2,4,5 scale
         if (
           Number.isInteger(parsed) &&
           ANSWER_MAP[parsed] !== undefined &&
@@ -214,18 +268,19 @@ apiRouter.post("/take-test", async (c) => {
     // Validate range
     if (value < -2 || value > 2) {
       errors.push(
-        `Answer for question ${qid} out of range [-2, 2]: ${value}`
+        `Svar for spørgsmål ${qid} er uden for intervallet [-2, 2]: ${value}`
       );
       continue;
     }
 
     answerMap.set(qid, value);
+    uploadAnswers[qid] = value;
   }
 
   if (answerMap.size === 0) {
     return c.json(
       {
-        error: "No valid answers could be parsed.",
+        error: "Ingen gyldige svar fundet.",
         details: errors.length ? errors : undefined,
       },
       400
@@ -278,6 +333,12 @@ apiRouter.post("/take-test", async (c) => {
     .sort((a, b) => a.distance - b.distance)
     .slice(0, 10);
 
+  // Build the upload file — compatible with the website's JSON upload
+  const profileLabel = body.label?.trim() || "API-profil";
+  const uploadFile = {
+    answers: uploadAnswers,
+  };
+
   const response: ApiTakeTestResponse = {
     scores: {
       PC1: parseFloat(projection.PC1.toFixed(4)),
@@ -293,6 +354,12 @@ apiRouter.post("/take-test", async (c) => {
 
   return c.json({
     ...response,
+    upload_file: {
+      description:
+        "Gem dette JSON-objekt som en .json-fil og upload det på hjemmesiden for at se din profil i graferne. Filnavnet bliver dit navn i grafen.",
+      filename_suggestion: `${profileLabel.replace(/[^a-zA-Z0-9æøåÆØÅ _-]/g, "")}.json`,
+      content: uploadFile,
+    },
     warnings: errors.length ? errors : undefined,
   });
 });
