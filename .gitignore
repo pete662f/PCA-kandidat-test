@@ -4,3 +4,6 @@ __pycache__/
 tmp
 analysis
 output
+node_modules/
+dist/
+bun.lock
