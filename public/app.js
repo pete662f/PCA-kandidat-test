@@ -221,15 +221,12 @@ function normalizeAnswerValue(rawValue) {
   if (Number.isNaN(numericValue)) {
     throw new Error(`Ugyldigt svar "${trimmed}".`);
   }
-  if (sourceSlug === "tv2" && [-2, -1, 0, 1, 2].includes(numericValue)) {
+  if ([-2, -1, 0, 1, 2].includes(numericValue)) {
     return numericValue;
   }
   const mapped = siteData.model.answer_map[String(Math.trunc(numericValue))];
   if (mapped !== undefined && Number.isInteger(numericValue)) {
     return Number(mapped);
-  }
-  if ([-2, -1, 1, 2].includes(numericValue)) {
-    return numericValue;
   }
   throw new Error(`Svaret "${trimmed}" er ikke understøttet.`);
 }
